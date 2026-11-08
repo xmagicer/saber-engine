@@ -2299,6 +2299,10 @@ impl<'g> Planner<'g> {
         mxfp4: &LaunchRules,
         rules: &SaberRules,
     ) -> Result<Option<Fusion>> {
+        // RCCL owns the collective; only native peer-memory reductions can carry this epilogue.
+        if rules.ar.external_rccl {
+            return Ok(None);
+        }
         // Row 3 ([`Self::gemm_ar_fusion`]) asks this same question for its reduce and norm, so
         // either flag opens it; the plain `_nq` call site checks `fuse` itself.
         if !(self.fuse || self.fuse_gemm_ar)
@@ -2531,7 +2535,8 @@ impl<'g> Planner<'g> {
         mxfp4: &LaunchRules,
         rules: &SaberRules,
     ) -> Result<Option<Fusion>> {
-        if !self.fuse_gemm_wht
+        if rules.ar.external_rccl
+            || !self.fuse_gemm_wht
             || rules.ar.race_check
             || self.collectives != Collectives::Real
             || self.bucket.phase() != Phase::Decode
@@ -6935,6 +6940,55 @@ mod tests {
             BlockPlan::with_options(&g, bucket, &layers, params, &mx, &r4, PlanOptions::BLOCK)
                 .expect("the identity plan");
         assert!(one.identity_launches > 0);
+    }
+
+    #[test]
+    fn rccl_retains_local_fusions_without_native_peer_reductions() {
+        let g = Graph::qwen38_27b(ModelConfig::qwen38_27b(), 2).expect("graph");
+        let layers: Vec<u32> = (0..g.config.num_hidden_layers).collect();
+        let mx = LaunchRules::prod_mxfp4().expect("rules");
+        let mut rules = SaberRules::prod_saber().expect("rules");
+        rules.ar.external_rccl = true;
+        for rank in [0, 1] {
+            for rows in [1, 8] {
+                let p = BlockPlan::with_options(
+                    &g,
+                    g.bucket_for(rows, Phase::Decode),
+                    &layers,
+                    RuntimeParams {
+                        max_ctx: 8192,
+                        gdn_slots: 8,
+                    },
+                    &mx,
+                    &rules,
+                    PlanOptions::FORWARD
+                        .rank(rank)
+                        .with_collectives(Collectives::Real)
+                        .with_decode_fusion()
+                        .with_gemm_wht(),
+                )
+                .expect("RCCL plan with local fusions");
+                assert_eq!((p.fused_nq, p.fused_gemm_ar, p.fused_gemm_wht), (0, 0, 0));
+                assert!(p.fused_pairs > 0, "local GEMM pairs must remain enabled");
+                assert!(
+                    p.fused_rope_appends > 0,
+                    "local rope/append must remain enabled"
+                );
+                let mut reduces = 0;
+                for step in &p.steps {
+                    if step.op.kernel == KernelOp::AllReduce {
+                        reduces += 1;
+                        let Route::Kernel { descs, .. } = &step.route else {
+                            panic!("collective must remain explicit")
+                        };
+                        assert_eq!(descs.len(), 1);
+                        assert_eq!(descs[0].plugin, saber_kernels::saber::RCCL_PLUGIN);
+                        assert!(descs[0].workspaces.is_empty());
+                    }
+                }
+                assert_eq!(reduces, 2 * g.config.num_hidden_layers + 1);
+            }
+        }
     }
 
     /// ws-h17: the `_nq` epilogue, taken by MESSAGE SIZE and only there.

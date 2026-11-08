@@ -4391,7 +4391,6 @@ fn run(
                 "RCCL compatibility requires TP=2".into(),
             ));
         }
-        resolved.decode_fusion = DecodeFusion::Off;
         resolved.ar_fuse = false;
         if resolved.race_check || resolved.race_shadow {
             return Err(ForwardError::Device(
@@ -4400,7 +4399,7 @@ fn run(
         }
         resolved.device_step = crate::device_step::DeviceStep::Off;
         resolved.ar_exact = true;
-        println!("collectives rank {}: RCCL compatibility; exact BF16, unfused collectives, host candidate seam", resolved.rank);
+        println!("collectives rank {}: RCCL compatibility; exact BF16, P2P AR fusion off, host candidate seam", resolved.rank);
     }
     let cfg = &resolved;
     let mut mark = Instant::now();

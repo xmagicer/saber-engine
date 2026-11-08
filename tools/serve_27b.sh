@@ -102,8 +102,11 @@ fi
 # provide RCCL >= 2.30.4; it need not be installed in the build image. Native P2P is unchanged.
 COLLECTIVE_ARGS=()
 COLLECTIVE_ENV=()
+COLLECTIVE_GPU_QUEUES=3
 if [ -n "${RCCL_LIB:-}" ]; then
   [ "$TP" = 2 ] || { echo "RCCL_LIB requires TP=2" >&2; exit 2; }
+  # Keep async readbacks on the model queue. Verified A/B/A on the non-P2P R9700 pair.
+  COLLECTIVE_GPU_QUEUES=1
   COLLECTIVE_ARGS+=(--engine-rccl-lib "$RCCL_LIB")
   COLLECTIVE_ENV=(-e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=0 -e NCCL_PROTO=Simple)
 fi
@@ -188,7 +191,7 @@ $CTR run -d --name "$CNAME" --security-opt label=disable --security-opt seccomp=
   "${CTR_GPU[@]}" "${CTR_USER[@]}" --ipc=host --network=host \
   -v "$REPO":/work -v "$PACKS":/packs:ro -v "$CACHE_REAL":"$CACHE_REAL" -v "$SHARED":"$SHARED" \
   -v "$REPO/.cache/cargo-registry":/opt/rust/cargo/registry -w /work \
-  "${COLLECTIVE_ENV[@]}" -e HIP_VISIBLE_DEVICES="$HIP_DEVICES" -e GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-3}" -e CUDA_VISIBLE_DEVICES= -e LD_LIBRARY_PATH=/opt/rocm/lib \
+  "${COLLECTIVE_ENV[@]}" -e HIP_VISIBLE_DEVICES="$HIP_DEVICES" -e GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-$COLLECTIVE_GPU_QUEUES}" -e CUDA_VISIBLE_DEVICES= -e LD_LIBRARY_PATH=/opt/rocm/lib \
   -e CARGO_TARGET_DIR=/work/.cache/target-container --entrypoint /bin/bash "$IMG" \
   -c "ulimit -c 0; exec ${SERVE_PREFIX:-} $SERVE_CMD" >/dev/null || { echo "$CTR run failed" >&2; exit 1; }
 echo "== $(date '+%T') booting $CNAME on :$PORT ($([ "$TP" = 1 ] && echo "TP=1 on HIP device $DEVICE, ")max ctx $MAX_CTX per sequence; the pack loads from NVMe)"

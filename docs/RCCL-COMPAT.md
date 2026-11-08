@@ -19,7 +19,7 @@ The native backend remains the default. `--engine-rccl-lib PATH` selects RCCL fo
   serving image supplies HIP/RCCL only; inference runs this branch's Rust Saber binary.
 - RCCL uses its validated v2.30.4 config ABI: blocking initialization and
   `graphUsageMode=2`, permitting eager prefill and captured decode together.
-- The profile uses BF16 sum collectives, disables decode/all-reduce fusion and
+- The profile uses BF16 sum collectives, disables native peer-memory all-reduce fusion, retains local decode fusions and
   selects Saber's existing host candidate exchange. It never opens peer VRAM or
   pretends that peer access succeeded. P2P race diagnostics and dispatch-record
   replay are refused explicitly.
@@ -43,13 +43,18 @@ export SABER_PACKS="$HOME/models/saber-packs"
 tools/fetch_packs.sh 27b
 
 # Build separately if your serving image does not have cargo.
-docker run --rm --user "$(id -u):$(id -g)"   -v "$PWD":/work -w /work   -e CARGO_TARGET_DIR=/work/.cache/target-container   --entrypoint bash localhost/saber-dev:latest   -c 'cargo build --locked --release -p saber-cli'
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD":/work -w /work \
+  -e CARGO_TARGET_DIR=/work/.cache/target-container \
+  --entrypoint bash localhost/saber-dev:latest \
+  -c 'cargo build --locked --release -p saber-cli'
 
 # This immutable runtime was tested: HIP 7.14.60850 and RCCL 2.30.4.
 export SABER_IMAGE=stilldeadcode/vllm-radiance@sha256:45694209177a55a1ab3ba6702fe6e978b1b66a6e66ae3fc066f8d579f7bc4c25
 export RCCL_LIB=/opt/rocm/lib/librccl.so
 # Bind to loopback behind an authenticated gateway. Omit HOST to bind all interfaces.
-HOST=127.0.0.1 PORT=18080 MODEL=qwen3.8-27b-mxfp4   tools/serve_27b.sh --tp 2 --no-build --enable-prefix-caching on
+HOST=127.0.0.1 PORT=18080 MODEL=qwen3.8-27b-mxfp4 \
+  tools/serve_27b.sh --tp 2 --no-build --enable-prefix-caching on
 curl -fsS http://127.0.0.1:18080/v1/models
 # Stop with the same container name/profile; restore your previous launch command to roll back.
 tools/serve_27b.sh --tp 2 stop
@@ -68,6 +73,7 @@ Compile/run inside the same GPU-enabled runtime image, with shared IPC and both
 GPUs exposed. Set `NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=0 NCCL_PROTO=Simple`:
 
 ```bash
+export NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=0 NCCL_PROTO=Simple
 hipcc --offload-arch=gfx1201 -O2 tools/probes/rccl_no_p2p.hip -lrccl -o /tmp/rccl-probe
 # Use a new private temporary directory for each run; start both ranks together.
 probe_dir=$(mktemp -d)
@@ -94,9 +100,11 @@ Prepare using the original server's `/tokenize` endpoint:
 
 ```bash
 python3 tools/bench/paired_http.py --prepare --payload-dir /tmp/paired-requests
-python3 tools/bench/paired_http.py --payload-dir /tmp/paired-requests   --output-dir /tmp/baseline --label baseline
+python3 tools/bench/paired_http.py --payload-dir /tmp/paired-requests \
+  --output-dir /tmp/baseline --label baseline
 # Switch backend, warm and verify it, then use the same payload directory:
-python3 tools/bench/paired_http.py --payload-dir /tmp/paired-requests   --output-dir /tmp/rccl --label saber-rccl
+python3 tools/bench/paired_http.py --payload-dir /tmp/paired-requests \
+  --output-dir /tmp/rccl --label saber-rccl
 ```
 
 The default suite is 57 requests in 24 batches: three repeats of single-stream
@@ -115,6 +123,28 @@ of engine speed or a proof of equal model quality.
 ## Validation scope
 
 The added compatibility checks plus existing HIP, execution and server tests pass
-316 tests (one existing documentation test ignored). The native descriptor path
+317 tests (one existing documentation test ignored). The native descriptor path
 is included in these regressions. Native P2P GPU execution cannot be tested on a
 host whose chipset rejects it; it remains a separate hardware validation item.
+
+## Measured queue and fusion regression
+
+On this non-P2P R9700 pair, the launcher now defaults to one HIP hardware queue
+for RCCL (`GPU_MAX_HW_QUEUES=1`); explicit overrides remain available. The native
+backend keeps its existing three-queue default. In A/B/A tests with identical
+six request bodies, three queues produced about 118/92 tokens/s for code/prose,
+one queue 163/127, and returning to three queues reproduced 118/92. All generated
+content bytes matched across those three runs. Local GEMM-pair and rope/append
+fusion increased the one-queue medians to about 167/129. These are approximate
+decode rates, not total concurrent throughput.
+
+Native AR-coupled fusions are explicitly refused in the planner for RCCL. Ordinary
+local fusions retain their configured setting; `--engine-no-decode-fusion` remains
+the unfused control. A plan regression checks both ranks, verifies that all 129
+collectives remain external, and that local fusions survive.
+
+Reducing the drafter block from eight to four made the tested workloads slower;
+it is not the default. A separate-communicator experiment using mode 1 was also
+rejected by real model acceptance and is not included. NCCL's mode 1 is a single
+graph hint, while this engine retains multiple bucket graphs; mixed mode 2 is the
+validated contract. See [NCCL graph usage types](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/types.html).
