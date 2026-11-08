@@ -27,6 +27,22 @@ use crate::error::Result;
 use crate::ffi::Lib;
 use crate::thread::{Ctx, Msg};
 
+/// Borrowed communicator token; the HIP thread owns the native RCCL resource.
+///
+/// Communicators remain alive until thread shutdown, after queued graph teardown.
+pub struct RcclComm {
+    pub(crate) raw: usize,
+    pub(crate) lib: std::sync::Arc<crate::rccl::RcclLib>,
+    pub(crate) owner: std::sync::Weak<()>,
+    pub(crate) not_send: PhantomData<*mut ()>,
+}
+
+impl std::fmt::Debug for RcclComm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RcclComm(borrowed from HipThread)")
+    }
+}
+
 /// A device address.
 ///
 /// `Copy`, `Send` and plain: this is what goes into a kernarg image and what crosses the channel to

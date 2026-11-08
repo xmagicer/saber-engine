@@ -341,6 +341,7 @@ impl PluginSet {
     ) -> Result<Self> {
         let paths: Vec<PathBuf> = names
             .iter()
+            .filter(|n| **n != saber_kernels::saber::RCCL_PLUGIN)
             .map(|n| dir.join(format!("{n}.manifest.toml")))
             .collect();
         Self::load_manifests(hip, dir, &paths, counters)

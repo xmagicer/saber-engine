@@ -74,6 +74,8 @@ pub struct EngineArgs {
     pub prebuilt: PathBuf,
     /// The HIP runtime's soname.
     pub hip_lib: String,
+    /// Optional RCCL compatibility library; selects host-capable collectives.
+    pub rccl_lib: Option<String>,
     /// HIP device ordinal within the visible set.
     pub device: i32,
     /// Refuse to start if the engine's device buffers would exceed this.
@@ -379,6 +381,7 @@ impl EngineArgs {
             rank: self.rank,
             prebuilt: self.prebuilt.clone(),
             hip_lib: self.hip_lib.clone(),
+            rccl_lib: self.rccl_lib.clone(),
             device: self.device,
             budget_mib: self.budget_mib,
             max_seqs: self.max_seqs,
@@ -10224,7 +10227,11 @@ impl Worker {
             .arg("--deadline-s")
             .arg(args.deadline_s.to_string());
         if !args.capture {
+            // Keep the follower on the leader's explicitly selected transport.
             cmd.arg("--no-capture");
+        }
+        if let Some(path) = &args.rccl_lib {
+            cmd.arg("--rccl-lib").arg(path);
         }
         // D4: the tower on rank 1 too (replicated), sized as the leader's.
         if args.vision_max_patches > 0 {
@@ -11316,6 +11323,7 @@ mod ar_band_tests {
             peer_device: 1,
             prebuilt: std::path::PathBuf::from("prebuilt/gfx1201"),
             hip_lib: saber_hip::DEFAULT_HIP_SONAME.to_owned(),
+            rccl_lib: None,
             device: 0,
             budget_mib: 26000,
             max_seqs: 2,

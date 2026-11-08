@@ -21,6 +21,7 @@ use std::ffi::{c_void, CString};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -29,12 +30,21 @@ use crate::ffi::{
     DeviceSchedule, EventFlags, IpcMemHandle, Lib, MallocFlags, MemcpyKind, StreamCaptureMode,
     StreamFlags,
 };
+use crate::handles::RcclComm;
 use crate::handles::{
     DeviceAddr, DevicePtr, Event, Function, Graph, GraphExec, ImportedPtr, Module, PinnedBuf,
     PinnedSlice, PinnedSliceMut, RawEvent, RawFunction, RawGraph, RawGraphExec, RawModule,
     RawStream, Stream,
 };
 use crate::lane::{Background, BatchTicket, Deps, Name};
+use crate::rccl::{RcclLib, RcclUniqueId};
+
+struct RcclState {
+    path: String,
+    lib: Arc<RcclLib>,
+    owner: Arc<()>,
+    comms: Vec<usize>,
+}
 
 /// Proof that the holder is running on the HIP thread.
 ///
@@ -691,6 +701,7 @@ pub struct HipThread {
     schedule: AtomicU32,
     /// FN106d: the page form of this handle's pinned allocations ([`crate::PinnedPages`]).
     pinned_pages: std::sync::atomic::AtomicU8,
+    rccl: Mutex<Option<RcclState>>,
 }
 
 impl HipThread {
@@ -746,6 +757,7 @@ impl HipThread {
                 wedged: AtomicBool::new(false),
                 schedule: AtomicU32::new(u32::MAX),
                 pinned_pages: std::sync::atomic::AtomicU8::new(0),
+                rccl: Mutex::new(None),
             }),
             Ok(Err(e)) => {
                 let _ = join.join();
@@ -1881,6 +1893,13 @@ impl HipThread {
         self.run(move |lib, ctx| unsafe { lib.graph_get_node_count(ctx, g.as_ptr()) })
     }
 
+    /// HIP node kinds, used to audit external-library graph synchronization nodes.
+    pub fn graph_node_types(&self, graph: &Graph) -> Result<Vec<i32>> {
+        let g = graph.raw;
+        // SAFETY: the borrowed graph stays alive and is not mutated during enumeration.
+        self.run(move |lib, ctx| unsafe { lib.graph_node_types(ctx, g.as_ptr()) })
+    }
+
     /// `hipGraphInstantiate`.
     pub fn instantiate(&self, graph: &Graph) -> Result<GraphExec> {
         let g = graph.raw;
@@ -1954,6 +1973,132 @@ impl std::fmt::Debug for HipThread {
     }
 }
 
+impl HipThread {
+    fn rccl_runtime(&self, path: &str) -> Result<(Arc<RcclLib>, std::sync::Weak<()>)> {
+        let mut slot = self
+            .rccl
+            .lock()
+            .map_err(|_| Error::Invalid("RCCL registry poisoned".into()))?;
+        if slot.is_none() {
+            let lib = self.run(|_, _| RcclLib::load(path))?;
+            *slot = Some(RcclState {
+                path: path.to_owned(),
+                lib,
+                owner: Arc::new(()),
+                comms: Vec::new(),
+            });
+        }
+        let state = slot.as_ref().expect("runtime initialized above");
+        if state.path != path {
+            return Err(Error::Invalid(
+                "One HIP thread cannot mix RCCL libraries".into(),
+            ));
+        }
+        Ok((Arc::clone(&state.lib), Arc::downgrade(&state.owner)))
+    }
+
+    /// Create a bootstrap ID, retaining its library on the owning HIP thread.
+    pub fn rccl_unique_id(&self, path: &str) -> Result<RcclUniqueId> {
+        let (lib, _) = self.rccl_runtime(path)?;
+        self.run(move |_, ctx| lib.unique_id(ctx))
+    }
+
+    /// Query the selected RCCL library version on the HIP thread.
+    pub fn rccl_library_version(&self, path: &str) -> Result<i32> {
+        let (lib, _) = self.rccl_runtime(path)?;
+        self.run(move |_, ctx| lib.version(ctx))
+    }
+
+    /// Initialize a communicator owned until this HIP thread shuts down.
+    pub fn rccl_init_rank(
+        &self,
+        path: &str,
+        world: i32,
+        rank: i32,
+        id: &RcclUniqueId,
+    ) -> Result<RcclComm> {
+        let (lib, owner) = self.rccl_runtime(path)?;
+        let mut slot = self
+            .rccl
+            .lock()
+            .map_err(|_| Error::Invalid("RCCL registry poisoned".into()))?;
+        let raw = self.run(|_, ctx| lib.init_rank(ctx, world, rank, id))?;
+        slot.as_mut()
+            .expect("runtime initialized above")
+            .comms
+            .push(raw);
+        Ok(RcclComm {
+            raw,
+            lib,
+            owner,
+            not_send: PhantomData,
+        })
+    }
+
+    fn check_rccl_owner(&self, comm: &RcclComm) -> Result<()> {
+        let slot = self
+            .rccl
+            .lock()
+            .map_err(|_| Error::Invalid("RCCL registry poisoned".into()))?;
+        let valid = slot.as_ref().is_some_and(|state| {
+            comm.owner
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, &state.owner))
+                && state.comms.contains(&comm.raw)
+        });
+        if !valid {
+            return Err(Error::Invalid(
+                "RCCL communicator belongs to another or closed HIP thread".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Enqueue an exact BF16 sum on a borrowed stream and device addresses.
+    pub fn rccl_all_reduce_bf16(
+        &self,
+        comm: &RcclComm,
+        src: DeviceAddr,
+        dst: DeviceAddr,
+        count: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.check_rccl_owner(comm)?;
+        let lib = Arc::clone(&comm.lib);
+        let (raw, s, d, st) = (
+            comm.raw,
+            src.as_u64() as usize,
+            dst.as_u64() as usize,
+            stream.raw.as_ptr() as usize,
+        );
+        self.run_with(Deps::on1(Name::Stream(stream.raw)), move |_, ctx| {
+            lib.all_reduce_bf16(ctx, raw, s, d, count, st)
+        })
+    }
+
+    /// Enqueue a byte all-gather on a borrowed stream and device addresses.
+    pub fn rccl_all_gather_bytes(
+        &self,
+        comm: &RcclComm,
+        src: DeviceAddr,
+        dst: DeviceAddr,
+        count: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.check_rccl_owner(comm)?;
+        let lib = Arc::clone(&comm.lib);
+        let (raw, s, d, st) = (
+            comm.raw,
+            src.as_u64() as usize,
+            dst.as_u64() as usize,
+            stream.raw.as_ptr() as usize,
+        );
+        self.run_with(Deps::on1(Name::Stream(stream.raw)), move |_, ctx| {
+            lib.all_gather_bytes(ctx, raw, s, d, count, st)
+        })
+    }
+}
+
 impl Drop for HipThread {
     fn drop(&mut self) {
         if self.wedged.load(Ordering::SeqCst) {
@@ -1961,6 +2106,26 @@ impl Drop for HipThread {
             tracing::error!("the HIP thread is wedged in a timed-out wait; detaching it");
             drop(self.join.take());
             return;
+        }
+        match self.rccl.get_mut() {
+            Ok(slot) => {
+                if let Some(state) = slot.take() {
+                    let job = Msg::Call(
+                        Box::new(move |_, ctx| {
+                            for comm in state.comms {
+                                if let Err(error) = state.lib.destroy(ctx, comm) {
+                                    tracing::error!(%error, "RCCL communicator destruction failed");
+                                }
+                            }
+                        }),
+                        Deps::All,
+                    );
+                    if self.tx.send(job).is_err() {
+                        tracing::warn!("HIP thread exited before RCCL teardown");
+                    }
+                }
+            }
+            Err(_) => tracing::error!("RCCL registry poisoned during shutdown"),
         }
         if self.tx.send(Msg::Shutdown).is_err() {
             tracing::warn!("HIP thread had already exited when HipThread was dropped");

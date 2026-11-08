@@ -111,6 +111,9 @@ pub struct Gdn {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Ar {
+    /// Explicit runtime backend choice; native rule files keep their existing semantics.
+    #[serde(skip)]
+    pub external_rccl: bool,
     pub group: u32,
     pub max_blocks: u32,
     pub chunk_groups_even_bits: u32,
@@ -146,6 +149,10 @@ pub struct Ar {
 
 /// CMP27S: the wave-parallel twin of the served wht6 bf16 one-shot (`hip/saber_ar_wht_wpar.hip`).
 pub const AR_WPAR_SYMBOL: &str = "saber_ar_wpar_2rank_wht6_bf16";
+/// Runtime-provided collective implementation, not a HIP code object.
+pub const RCCL_PLUGIN: &str = "saber_rccl";
+/// External BF16 sum entry with [`abi::SIG_RCCL_BF16`].
+pub const RCCL_BF16_KERNEL: &str = "nccl_allreduce_bf16";
 /// The served symbol [`AR_WPAR_SYMBOL`] replaces.
 pub const AR_WPAR_SOURCE: &str = "saber_ar_oneshot_2rank_wht6_bf16";
 /// `SABER_WPAR_CPB_MAX`: the LDS word buffer's chunks a block (8 x 32 lanes x 12 words = 12 KiB).
@@ -3671,6 +3678,9 @@ fn ar_family(
     rules: &SaberRules,
     names: ArNames<'_>,
 ) -> Result<LaunchDescriptor> {
+    if rules.ar.external_rccl {
+        return ar_exact(s, dtype, reg, rules, names);
+    }
     // The size decides the `exact` key; the registry decides the kernel. Same split the reference draws,
     // same two-step rule ref_allreduce.py applies per call.
     match dtype
@@ -3734,6 +3744,33 @@ fn ar_exact(
     rules: &SaberRules,
     names: ArNames<'_>,
 ) -> Result<LaunchDescriptor> {
+    if rules.ar.external_rccl {
+        if dtype.name() != "bf16" || s.elem_bytes != 2 || s.world_size != 2 {
+            return Err(Error::Rule(
+                "RCCL compatibility currently requires TP=2 BF16 collectives".into(),
+            ));
+        }
+        ar_message_ok(&s, rules, "allreduce")?;
+        let count = i64::try_from(s.n_elem)
+            .map_err(|_| Error::Rule("RCCL element count overflow".into()))?;
+        let (args, bytes) = KArgs::new(abi::SIG_RCCL_BF16)
+            .buf(names.input)
+            .buf(names.output)
+            .i32(count)
+            .finish()?;
+        return Ok(LaunchDescriptor {
+            op: "allreduce_rccl_bf16".into(),
+            plugin: RCCL_PLUGIN.into(),
+            kernel: RCCL_BF16_KERNEL.into(),
+            grid: [1, 1, 1],
+            block: [1, 1, 1],
+            shared_bytes: 0,
+            kernarg_bytes: bytes,
+            args,
+            workspaces: Vec::new(),
+            n_launches: 1,
+        });
+    }
     let a = &rules.ar;
     let g = Geometry::new()
         .num("world_size", s.world_size as i64)

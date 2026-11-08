@@ -59,6 +59,7 @@ mod handles;
 mod lane;
 pub mod pinned;
 pub mod process;
+mod rccl;
 pub mod shmline;
 mod thread;
 
@@ -68,12 +69,14 @@ pub use ffi::{
     DeviceSchedule, EventFlags, IpcMemHandle, MallocFlags, MemcpyKind, StreamCaptureMode,
     StreamFlags, DEFAULT_HIP_SONAME, IPC_HANDLE_BYTES,
 };
+pub use handles::RcclComm;
 pub use handles::{
     DeviceAddr, DevicePtr, Event, Function, Graph, GraphExec, ImportedPtr, Module, PinnedBuf,
     PinnedChunk, PinnedSlice, PinnedSliceMut, Stream, StreamId,
 };
 pub use lane::BatchTicket;
 pub use pinned::PinnedPages;
+pub use rccl::RcclUniqueId;
 pub use thread::{full_cu_mask, Ctx, HipThread, Job, RuntimeInfo};
 
 #[cfg(test)]

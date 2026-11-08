@@ -647,6 +647,8 @@ pub struct EngineConfig {
     pub prebuilt: PathBuf,
     /// The HIP runtime's soname.
     pub hip_lib: String,
+    /// Explicit RCCL compatibility backend; `None` retains the native P2P backend.
+    pub rccl_lib: Option<String>,
     /// HIP device ordinal within the visible set.
     pub device: i32,
     /// Refuse to start if the engine's device buffers would exceed this. The byte ledger is the
@@ -4382,6 +4384,25 @@ fn run(
     mut phases: crate::startup::Phases,
 ) -> Result<(), ForwardError> {
     use crate::startup::Phase as Boot;
+    let mut resolved = cfg.clone();
+    if resolved.rccl_lib.is_some() {
+        if resolved.world != 2 {
+            return Err(ForwardError::Device(
+                "RCCL compatibility requires TP=2".into(),
+            ));
+        }
+        resolved.decode_fusion = DecodeFusion::Off;
+        resolved.ar_fuse = false;
+        if resolved.race_check || resolved.race_shadow {
+            return Err(ForwardError::Device(
+                "P2P race diagnostics are unavailable with RCCL compatibility".into(),
+            ));
+        }
+        resolved.device_step = crate::device_step::DeviceStep::Off;
+        resolved.ar_exact = true;
+        println!("collectives rank {}: RCCL compatibility; exact BF16, unfused collectives, host candidate seam", resolved.rank);
+    }
+    let cfg = &resolved;
     let mut mark = Instant::now();
     hip.set_device(cfg.device)
         .map_err(device_err("set_device"))?;
@@ -4574,6 +4595,10 @@ fn run(
     }
     let mxfp4 = mxfp4;
     let mut saber = SaberRules::prod_saber().map_err(device_err("saber rules"))?;
+    if cfg.rccl_lib.is_some() {
+        saber.ar.external_rccl = true;
+        saber.name = format!("{}+rccl-bf16", saber.name);
+    }
     // T4: every all-reduce resolves to its race-check twin. Set before any plan resolves a reduce,
     // so the target's, the drafter's and row 3's fold all see the same answer.
     saber.ar.race_check = cfg.race_check;
@@ -4648,6 +4673,74 @@ fn run(
         None => None,
     };
     let follower = matches!(cfg.peer.as_ref().map(|p| p.role), Some(PeerRole::Follower));
+    if let Some(p) = &peer {
+        p.agree(
+            "engine.collective-backend",
+            u64::from(cfg.rccl_lib.is_some()),
+        )
+        .map_err(|e| ForwardError::Peer(e.to_string()))?;
+    }
+    let rccl = if let Some(path) = &cfg.rccl_lib {
+        let p = peer
+            .as_ref()
+            .ok_or_else(|| ForwardError::Peer("RCCL requires a rank peer".into()))?;
+        let before = hip.mem_info().map_err(device_err("RCCL memory before"))?.0;
+        let version = hip
+            .rccl_library_version(path)
+            .map_err(device_err("loading RCCL"))?;
+        p.agree("engine.rccl-version", version as u64)
+            .map_err(|e| ForwardError::Peer(e.to_string()))?;
+        let mine = if cfg.rank == 0 {
+            hip.rccl_unique_id(path)
+                .map_err(device_err("RCCL bootstrap ID"))?
+                .as_bytes()
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+        let theirs = p
+            .exchange()
+            .xchg_bytes("engine.rccl-id", &mine)
+            .map_err(|e| ForwardError::Peer(e.to_string()))?;
+        let id = saber_hip::RcclUniqueId::from_bytes(if cfg.rank == 0 { &mine } else { &theirs })
+            .map_err(device_err("RCCL ID frame"))?;
+        let comm = hip
+            .rccl_init_rank(path, cfg.world as i32, cfg.rank as i32, &id)
+            .map_err(device_err("RCCL communicator"))?;
+        {
+            let warm = hip
+                .malloc(saber.ar.max_bytes)
+                .map_err(device_err("RCCL warm buffer"))?;
+            let stream = hip
+                .create_stream(saber_hip::StreamFlags::NonBlocking)
+                .map_err(device_err("RCCL warm stream"))?;
+            hip.memset(&warm, 0, &stream)
+                .map_err(device_err("RCCL warm zero"))?;
+            hip.rccl_all_reduce_bf16(
+                &comm,
+                warm.addr(),
+                warm.addr(),
+                (saber.ar.max_bytes / 2) as usize,
+                &stream,
+            )
+            .map_err(device_err("RCCL warm collective"))?;
+            hip.sync_stream(&stream)
+                .map_err(device_err("RCCL warm completion"))?;
+        }
+        let after = hip.mem_info().map_err(device_err("RCCL memory after"))?.0;
+        let bytes = before.saturating_sub(after);
+        ledger
+            .reserve(Pool::Vram(cfg.rank), "engine.collectives.rccl", bytes)
+            .map_err(device_err("RCCL memory ledger"))?;
+        println!(
+            "collectives rank {}: RCCL {version}, native reservation {} MiB",
+            cfg.rank,
+            bytes >> 20
+        );
+        Some(std::rc::Rc::new(comm))
+    } else {
+        None
+    };
 
     let layers: Vec<u32> = (0..graph.config.num_hidden_layers).collect();
     let decode_widths = planned_widths(&cfg.decode_widths)?;
@@ -7097,6 +7190,9 @@ fn run(
     // `Launcher` refuses a resize by name if anything tries.
     let launch_counters = LaunchCounters::new();
     let mut launcher = Launcher::new(format!("engine.r{}", cfg.rank), &launch_counters);
+    if let Some(comm) = &rccl {
+        launcher = launcher.with_rccl(std::rc::Rc::clone(comm));
+    }
     if let Some(p) = &peer {
         launcher = launcher.with_peer(Arc::clone(p));
     }
@@ -8233,7 +8329,7 @@ fn run(
                 )));
             }
             let want = res.shapes[ix].plan.captured_launches();
-            if bucket.node_count() != want as usize || bucket.declared_launches() != want {
+            if bucket.kernel_node_count() != want as usize || bucket.declared_launches() != want {
                 return Err(ForwardError::Device(format!(
                     "the drafter's backbone at {reqs} request(s) captured {} node(s) and {} \
                      declared launch(es) against a budget of {want}",
@@ -8265,7 +8361,7 @@ fn run(
                 )
                 .map_err(device_err("capturing the drafter's tail"))?;
                 let want = res.shapes[ix].plan.tail_launches();
-                if b.node_count() != want as usize || b.declared_launches() != want {
+                if b.kernel_node_count() != want as usize || b.declared_launches() != want {
                     return Err(ForwardError::Device(format!(
                         "the drafter's tail at {reqs} request(s) captured {} node(s) and {} \
                          declared launch(es) against a budget of {want}",
@@ -15995,8 +16091,9 @@ fn capture_step(
         counters,
     )
     .map_err(device_err("capturing the step"))?;
-    // Rule 7, at capture: the node count IS the declared budget for this shape.
-    if bucket.declared_launches() != want || bucket.node_count() != want as usize {
+    // Rule 7: compute nodes match this shape's launch budget. CapturedBucket has
+    // separately audited any external RCCL completion-event nodes.
+    if bucket.declared_launches() != want || bucket.kernel_node_count() != want as usize {
         return Err(ForwardError::Device(format!(
             "capture `{shape}`: {} nodes and {} declared launches against a budget of {want}",
             bucket.node_count(),

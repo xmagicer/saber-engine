@@ -97,6 +97,9 @@ const fn a(name: &'static str, kind: ArgKind) -> SigArg {
     }
 }
 
+/// Logical argument contract of the external RCCL BF16 sum implementation.
+pub const SIG_RCCL_BF16: &[SigArg] = &[a("in", Buffer), a("out", Buffer), a("count", I32)];
+
 /// A POINTER slot that declares what one element of it is, in bytes. See [`SigArg::elem`].
 const fn p(name: &'static str, elem: u32) -> SigArg {
     SigArg {

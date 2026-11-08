@@ -320,6 +320,7 @@ fn peer_base_name(name: &str) -> Option<String> {
 
 /// One stream's dispatcher: the workspace arenas, the counters, and the kernarg staging buffer.
 pub struct Launcher {
+    rccl: Option<std::rc::Rc<saber_hip::RcclComm>>,
     stream_label: String,
     counters: Arc<LaunchCounters>,
     /// Aliasable slabs, indexed by the order a descriptor asks for them. Index `i` is handed to
@@ -521,6 +522,7 @@ impl Launcher {
     #[must_use]
     pub fn new(label: impl Into<String>, counters: &Arc<LaunchCounters>) -> Self {
         Launcher {
+            rccl: None,
             stream_label: label.into(),
             counters: Arc::clone(counters),
             scratch: Vec::new(),
@@ -554,6 +556,58 @@ impl Launcher {
     pub fn with_peer(mut self, peer: Arc<RankPeer>) -> Self {
         self.peer = Some(peer);
         self
+    }
+
+    /// Bind the HIP-thread-owned collective implementation selected by the resolved plan.
+    #[must_use]
+    pub fn with_rccl(mut self, comm: std::rc::Rc<saber_hip::RcclComm>) -> Self {
+        self.rccl = Some(comm);
+        self
+    }
+
+    fn rccl_args(
+        &self,
+        desc: &LaunchDescriptor,
+        args: &ArgBindings,
+    ) -> Result<(DeviceAddr, DeviceAddr, usize)> {
+        use saber_kernels::saber::{RCCL_BF16_KERNEL, RCCL_PLUGIN};
+        if desc.plugin != RCCL_PLUGIN
+            || desc.kernel != RCCL_BF16_KERNEL
+            || desc.op != "allreduce_rccl_bf16"
+            || !desc.workspaces.is_empty()
+            || desc.args.len() != 3
+        {
+            return Err(Error::Refused(
+                "Invalid external RCCL collective descriptor".into(),
+            ));
+        }
+        if self.rccl.is_none() {
+            return Err(Error::Refused(
+                "RCCL descriptor has no initialized communicator".into(),
+            ));
+        }
+        let buffer = |name: &str| -> Result<DeviceAddr> {
+            match desc.arg(name).map(|s| &s.value) {
+                Some(ArgValue::Buffer { buffer }) => args
+                    .get(buffer)
+                    .filter(|a| *a != DeviceAddr::NULL)
+                    .ok_or_else(|| Error::Refused(format!("RCCL buffer {buffer} is unbound"))),
+                _ => Err(Error::Refused(format!(
+                    "RCCL descriptor has no buffer argument {name}"
+                ))),
+            }
+        };
+        let count = match desc.arg("count").map(|s| &s.value) {
+            Some(ArgValue::I32 { ival }) if *ival > 0 => {
+                usize::try_from(*ival).map_err(|_| Error::Refused("RCCL count overflow".into()))?
+            }
+            _ => {
+                return Err(Error::Refused(
+                    "RCCL descriptor has no positive element count".into(),
+                ))
+            }
+        };
+        Ok((buffer("in")?, buffer("out")?, count))
     }
 
     /// The other rank, if this launcher serves a collective.
@@ -677,6 +731,28 @@ impl Launcher {
         args: &ArgBindings,
         stream: &Stream,
     ) -> Result<LaunchReport> {
+        if desc.plugin == saber_kernels::saber::RCCL_PLUGIN {
+            if self.recorder.is_some() {
+                return Err(Error::Refused(
+                    "Dispatch recording cannot replay external RCCL collectives".into(),
+                ));
+            }
+            let (input, output, count) = self.rccl_args(desc, args)?;
+            ctx.hip.rccl_all_reduce_bf16(
+                self.rccl.as_ref().expect("checked above"),
+                input,
+                output,
+                count,
+                stream,
+            )?;
+            self.counters.hit_launched();
+            self.counters.hit_ar_plain();
+            return Ok(LaunchReport {
+                launches: 1,
+                scratch_allocated: 0,
+                persistent_allocated: 0,
+            });
+        }
         let Some((function, decl)) = ctx.functions.get(&desc.plugin, &desc.kernel) else {
             return Err(Error::NotFound(format!(
                 "`{}` has no kernel `{}` loaded (plugin not loaded, or the symbol is not in it)",
@@ -1019,6 +1095,10 @@ impl Launcher {
         args: &ArgBindings,
         stream: &Stream,
     ) -> Result<()> {
+        if desc.plugin == saber_kernels::saber::RCCL_PLUGIN {
+            self.rccl_args(desc, args)?;
+            return Ok(());
+        }
         let mut report = LaunchReport {
             launches: 0,
             scratch_allocated: 0,

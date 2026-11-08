@@ -2319,6 +2319,10 @@ enum Cmd {
         #[arg(long, default_value = DEFAULT_HIP_SONAME, help = HIP_LIB_HELP)]
         hip_lib: String,
 
+        /// Explicit RCCL compatibility transport (TP=2, host-capable collectives).
+        #[arg(long)]
+        engine_rccl_lib: Option<String>,
+
         /// The Saber manifest, resolved exactly as `saber explain` resolves it
         #[arg(long, default_value = "examples/qwen38-27b-nvfp4-tp2.toml")]
         manifest: PathBuf,
@@ -3116,6 +3120,10 @@ enum Cmd {
         #[arg(long, default_value = DEFAULT_HIP_SONAME, help = HIP_LIB_HELP)]
         hip_lib: String,
 
+        /// Explicit RCCL compatibility transport (TP=2, host-capable collectives).
+        #[arg(long)]
+        rccl_lib: Option<String>,
+
         /// The Flash-Next path's flags (FN12): used only when the pack's manifest names
         /// `qwen4_exp`; a 27B pack refuses any of them off its default.
         #[command(flatten)]
@@ -3450,6 +3458,10 @@ enum Cmd {
 
         #[arg(long, default_value = DEFAULT_HIP_SONAME, help = HIP_LIB_HELP)]
         hip_lib: String,
+
+        /// Explicit RCCL compatibility transport (TP=2, host-capable collectives).
+        #[arg(long)]
+        rccl_lib: Option<String>,
     },
 
     /// The P0 autotune sweep: measure every untuned route and write the cache
@@ -4908,6 +4920,7 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
             propose_in_step,
             engine_deadline_s,
             hip_lib,
+            engine_rccl_lib,
             manifest,
             prebuilt,
             autotune,
@@ -5009,6 +5022,7 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
                         peer_device: engine_peer_device,
                         prebuilt,
                         hip_lib,
+                        rccl_lib: engine_rccl_lib,
                         device: engine_device,
                         budget_mib: engine_budget_mib,
                         max_seqs: engine_max_seqs,
@@ -5422,6 +5436,7 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
             device,
             deadline_s,
             hip_lib,
+            rccl_lib,
             fnx,
         } => {
             // FN12, the model selection law: the pack's manifest decides the path. A Flash-Next
@@ -5469,6 +5484,7 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
                     peer_device,
                     prebuilt,
                     hip_lib,
+                    rccl_lib: rccl_lib,
                     device,
                     budget_mib,
                     max_seqs,
@@ -5711,6 +5727,8 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
             head,
             deadline_s,
             hip_lib,
+
+            rccl_lib,
         } => engine::worker(&engine::WorkerArgs {
             engine: engine::EngineArgs {
                 vision_max_patches,
@@ -5726,6 +5744,7 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
                 peer_device: device,
                 prebuilt,
                 hip_lib,
+                rccl_lib: rccl_lib,
                 device,
                 budget_mib,
                 max_seqs,
