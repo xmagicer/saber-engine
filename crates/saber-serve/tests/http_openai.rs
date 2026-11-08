@@ -400,6 +400,44 @@ async fn reasoning_then_content_splits_across_a_tag_boundary() {
 
 const TOOL_OUTPUT: &str = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
 
+#[tokio::test]
+async fn forced_tool_choices_deliver_parsed_calls_in_both_response_modes() {
+    for choice in [
+        json!("required"),
+        json!({"type":"function","function":{"name":"get_weather"}}),
+    ] {
+        for streaming in [false, true] {
+            let (base, _engine) = spawn(vec![MockScript::in_steps_of(
+                bytes_of(TOOL_OUTPUT),
+                4,
+                FinishReason::Stop,
+            )])
+            .await;
+            let response = reqwest::Client::new().post(format!("{base}/v1/chat/completions"))
+                .json(&chat_body(json!({"tools":weather_tools(),"tool_choice":choice,
+                    "stream":streaming,"max_tokens":500,"chat_template_kwargs":{"enable_thinking":false}})))
+                .send().await.expect("request");
+            assert_eq!(response.status(), 200);
+            if streaming {
+                let text = response.text().await.expect("SSE");
+                let view = read_sse(&text);
+                assert!(text.contains("get_weather"), "{text}");
+                assert!(text.contains("tool_calls"), "{text}");
+                assert!(text.contains("[DONE]"));
+                assert!(view.content.is_empty());
+            } else {
+                let response: Value = response.json().await.expect("JSON");
+                let call = &response["choices"][0]["message"]["tool_calls"][0];
+                assert_eq!(call["function"]["name"], json!("get_weather"));
+                let arguments: Value =
+                    serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+                assert_eq!(arguments, json!({"city":"Paris","days":3}));
+                assert_eq!(response["choices"][0]["finish_reason"], json!("tool_calls"));
+            }
+        }
+    }
+}
+
 fn weather_tools() -> Value {
     json!([{
         "type": "function",
