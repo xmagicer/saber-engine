@@ -83,6 +83,11 @@ path = "prebuilt/gfx1201/saber_attn.hsaco"
 build_hash = "cc4be96e76328b0840f89bb8865853c7c3e4304a989b622d18d001beae370d13"
 
 [[plugins]]
+name = "saber_attn16"
+path = "prebuilt/gfx1201/saber_attn16.hsaco"
+build_hash = "4243a99ee4f950113ae24864baa4a1b47571d3a02603df36be5e3020b9101353"
+
+[[plugins]]
 name = "saber_gdn_chunk_scan"
 path = "prebuilt/gfx1201/saber_gdn_chunk_scan.hsaco"
 build_hash = "e562414a3c07906bb54d47b075f0263dbb93abd3aa038ac3f1fc2762b17211e2"

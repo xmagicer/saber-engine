@@ -504,6 +504,8 @@ pub fn plugin_for(symbol: &str) -> Result<&'static str> {
     {
         // The ragged pair (C2) BEFORE the uniform attention, whose prefix it shares.
         Ok("saber_attn_ragged")
+    } else if symbol.starts_with("saber_attn_decode_uniform16_") {
+        Ok("saber_attn16")
     } else if symbol.starts_with("saber_attn_") {
         Ok("saber_attn")
     } else if symbol.starts_with("saber_gdn_fused_update_f16s_") {
@@ -1689,6 +1691,34 @@ fn attn_prefill(
     })
 }
 
+/// Both split-KV dispatches bind the same partials, including the uniform 16-query tile.
+fn decode_scratch(s: &AttnShape, rules: &SaberRules, splits: u32) -> Result<WorkspaceReq> {
+    let knobs = &rules.knobs;
+    if s.q_len == 16
+        && s.ragged_rows == 0
+        && (!knobs.combine_partial_f16
+            || knobs.decode_tile != 16
+            || knobs.combine_partial_bytes_per_split != 520
+            || s.num_seqs == 0)
+    {
+        return Err(Error::Rule("attn_decode: uniform16 requires a nonempty batch, 16-key tiles and 520-byte f16 partials".into()));
+    }
+    let need = rules.decode_scratch_bytes(s, splits);
+    let ws = rules.workspace("attn_decode_scratch")?;
+    if need > ws.capacity_bytes {
+        return Err(Error::Rule(format!(
+            "attn_decode: {need} B of split-KV partials exceeds the {} B declared for attn_decode_scratch",
+            ws.capacity_bytes
+        )));
+    }
+    Ok(WorkspaceReq {
+        name: "attn_decode_scratch".into(),
+        kind: ws.kind,
+        bytes: need,
+        zero_once: false,
+    })
+}
+
 fn attn_decode(s: AttnShape, reg: &Registry<'_>, rules: &SaberRules) -> Result<LaunchDescriptor> {
     let g = attn_geometry(&s, true, rules)?;
     let row = reg.select(decode_op(&s), &g).map_err(Error::Rule)?;
@@ -1708,44 +1738,46 @@ fn attn_decode(s: AttnShape, reg: &Registry<'_>, rules: &SaberRules) -> Result<L
     let kn = &rules.knobs;
     let gqa = s.q_heads / s.kv_heads;
     let rows = s.q_len * gqa;
-    // The registry's `q_len <= 10` already covers this at gqa 6; the entry point checks the
-    // product, which is the condition that actually binds, and returns -4 rather than running.
-    if rows > kn.attn_max_decode_rows {
-        return Err(Error::Rule(format!(
-            "attn_decode: q_len {} x gqa {gqa} = {rows} rows exceeds the {} a decode workgroup \
-             holds",
-            s.q_len, kn.attn_max_decode_rows
-        )));
-    }
     let nw = rows.div_ceil(kn.decode_rows_per_warp).max(1);
     let sym = rules
         .attn_decode
         .iter()
         .find(|r| r.entry == row.entry && r.nw == nw)
         .ok_or_else(|| Error::Rule(format!("{}: no nw={nw} instantiation", row.entry)))?;
-    let combine = combine_row(&s, rules)?;
-    let splits = rules.decode_splits(s.max_ctx, s.kv_heads, s.num_seqs, s.splits);
-    let need = rules.decode_scratch_bytes(&s, splits);
-    let ws = rules.workspace("attn_decode_scratch")?;
-    if need > ws.capacity_bytes {
+    let plugin = plugin_for(&sym.symbol)?;
+    if plugin == "saber_attn16" {
+        // This separately compiled object has six waves. Its 96 rows must never be
+        // attributed to the four-wave uniform or ragged objects.
+        let expected_symbol = match s.kv_dtype {
+            KvDtype::Fp8E4m3 => "saber_attn_decode_uniform16_h256_gqa6_fp8kv_nw6",
+            KvDtype::Bf16 => "saber_attn_decode_uniform16_h256_gqa6_bf16kv_nw6",
+        };
+        if sym.symbol != expected_symbol
+            || s.q_len != 16
+            || s.ragged_rows != 0
+            || gqa != 6
+            || nw != 6
+            || s.head_dim != 256
+            || s.block_size != 16
+        {
+            return Err(Error::Rule(
+                "attn_decode: invalid uniform16 geometry".into(),
+            ));
+        }
+    } else if rows > kn.attn_max_decode_rows {
         return Err(Error::Rule(format!(
-            "attn_decode: {need} B of split-KV partials exceeds the {} B declared for \
-             attn_decode_scratch; the buffer is sized once at construction because allocating \
-             during a graph capture is not allowed",
-            ws.capacity_bytes
+            "attn_decode: q_len {} x gqa {gqa} = {rows} rows exceeds the {} a decode workgroup holds",
+            s.q_len, kn.attn_max_decode_rows
         )));
     }
+    let combine = combine_row(&s, rules)?;
+    let splits = rules.decode_splits(s.max_ctx, s.kv_heads, s.num_seqs, s.splits);
+    let workspaces = vec![decode_scratch(&s, rules, splits)?];
     let (args, bytes) = attn_args(&s, splits, None)?;
-    let workspaces = vec![WorkspaceReq {
-        name: "attn_decode_scratch".into(),
-        kind: ws.kind,
-        bytes: need,
-        zero_once: false,
-    }];
     let _ = combine;
     Ok(LaunchDescriptor {
         op: "attn_decode".into(),
-        plugin: plugin_for(&sym.symbol)?.into(),
+        plugin: plugin.into(),
         kernel: sym.symbol.clone(),
         grid: [splits, s.kv_heads, s.num_seqs],
         block: [nw * 32, 1, 1],
@@ -1788,7 +1820,7 @@ pub fn attn_decode_combine(s: AttnShape, rules: &SaberRules) -> Result<LaunchDes
         s.num_seqs * s.q_len * s.q_heads
     };
     let (args, bytes) = attn_args(&s, splits, Some(kn.decode_tile))?;
-    let ws = rules.workspace("attn_decode_scratch")?;
+    let workspaces = vec![decode_scratch(&s, rules, splits)?];
     Ok(LaunchDescriptor {
         op: "attn_decode_combine".into(),
         plugin: plugin_for(&combine.symbol)?.into(),
@@ -1799,12 +1831,7 @@ pub fn attn_decode_combine(s: AttnShape, rules: &SaberRules) -> Result<LaunchDes
         shared_bytes: splits * 4,
         kernarg_bytes: bytes,
         args,
-        workspaces: vec![WorkspaceReq {
-            name: "attn_decode_scratch".into(),
-            kind: ws.kind,
-            bytes: rules.decode_scratch_bytes(&s, splits),
-            zero_once: false,
-        }],
+        workspaces,
         n_launches: 1,
     })
 }

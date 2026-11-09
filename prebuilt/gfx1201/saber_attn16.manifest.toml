@@ -1,0 +1,57 @@
+schema_version = 1
+plugin = "saber_attn16"
+arch = "gfx1201"
+source = "crates/saber-kernels/hip/saber_attn16.hip"
+source_sha256 = "675b292b2273fb432f251cd2bd8b2b488dd8d70891e372c9e2f292a4ac394728"
+flags = "--genco --offload-arch=gfx1201 -O3 -ffp-contract=off"
+build_hash = "4243a99ee4f950113ae24864baa4a1b47571d3a02603df36be5e3020b9101353"
+hsaco = "saber_attn16.hsaco"
+hsaco_sha256 = "37d2035195910d26636c66189824b92e834d13f2916c57934f8df9f970496008"
+
+[[kernel]]
+name = "saber_attn_decode_uniform16_h256_gqa6_bf16kv_nw6"
+symbol = "saber_attn_decode_uniform16_h256_gqa6_bf16kv_nw6.kd"
+kernarg_segment_size = 140
+kernarg_segment_align = 8
+group_segment_fixed_size = 12288
+private_segment_fixed_size = 32
+vgpr_count = 256
+sgpr_count = 34
+wavefront_size = 32
+max_flat_workgroup_size = 192
+
+[[kernel.arg]]
+offset = 0
+size = 136
+value_kind = "by_value"
+name = "args"
+
+[[kernel.arg]]
+offset = 136
+size = 4
+value_kind = "by_value"
+name = "splits"
+
+[[kernel]]
+name = "saber_attn_decode_uniform16_h256_gqa6_fp8kv_nw6"
+symbol = "saber_attn_decode_uniform16_h256_gqa6_fp8kv_nw6.kd"
+kernarg_segment_size = 140
+kernarg_segment_align = 8
+group_segment_fixed_size = 12288
+private_segment_fixed_size = 0
+vgpr_count = 253
+sgpr_count = 40
+wavefront_size = 32
+max_flat_workgroup_size = 192
+
+[[kernel.arg]]
+offset = 0
+size = 136
+value_kind = "by_value"
+name = "args"
+
+[[kernel.arg]]
+offset = 136
+size = 4
+value_kind = "by_value"
+name = "splits"

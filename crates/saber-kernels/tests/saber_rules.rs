@@ -72,8 +72,8 @@ fn prod_rules_load_and_check() {
     named.extend(r.ar_exact.iter().map(|x| x.symbol.as_str()));
     named.extend(r.ar_exact_nq.iter().map(|x| x.symbol.as_str()));
     // 54 + C1's f16 stored-state rows (8 recurrent, 2 fused, 1 scan) + C2's ragged attention
-    // (8 decode, 2 combine).
-    assert_eq!(named.len(), 75);
+    // (8 decode, 2 combine) + 2 uniform16 decode rows.
+    assert_eq!(named.len(), 77);
     let dir = prebuilt::dir();
     let mut have: Vec<String> = Vec::new();
     // Every committed saber plugin, taken from the manifest list rather than a second copy of it.
@@ -170,7 +170,7 @@ fn the_registry_selects_what_prod_binds() {
     let g11 = g.num("q_len", 11);
     assert_eq!(
         reg.select("attn_decode_paged", &g11).unwrap_err(),
-        "q_len=11, needs <= 10"
+        "q_len=11, needs <= 10; q_len=11, needs == 16"
     );
 }
 
@@ -386,6 +386,80 @@ fn decode_picks_the_warp_count_from_the_spec_width_and_the_splits_from_the_law()
         assert_eq!(c.block, [256, 1, 1]);
         assert_eq!(c.shared_bytes, splits * 4);
         assert_eq!(c.kernarg_bytes, 144);
+    }
+}
+
+#[test]
+fn uniform16_uses_six_waves_and_the_real_partial_layout() {
+    let r = rules();
+    let manifest = Manifest::load(prebuilt::dir().join("saber_attn16.manifest.toml")).unwrap();
+    for (dtype, suffix) in [(KvDtype::Fp8E4m3, "fp8"), (KvDtype::Bf16, "bf16")] {
+        let mut s = attn(2, 16, 8192);
+        s.kv_dtype = dtype;
+        let head = resolve(Op::AttnDecode, Shape::Attn(s), &r).unwrap();
+        assert_eq!(
+            head.kernel,
+            format!("saber_attn_decode_uniform16_h256_gqa6_{suffix}kv_nw6")
+        );
+        assert_eq!(head.plugin, "saber_attn16");
+        assert_eq!(head.block, [192, 1, 1]);
+        let splits = r.decode_splits(s.max_ctx, s.kv_heads, s.num_seqs, s.splits);
+        let bytes = u64::from(2 * 16 * 12 * splits) * 520;
+        assert_eq!(head.grid, [splits, 2, 2]);
+        assert_eq!(head.workspaces[0].bytes, bytes);
+        assert_eq!(head.kernarg_bytes, 140);
+        manifest
+            .check_signature(&head.kernel, abi::SIG_SABER_ATTN_DECODE)
+            .unwrap();
+
+        let combine = saber::attn_decode_combine(s, &r).unwrap();
+        assert_eq!(combine.kernel, "saber_attn_splitkv_combine_h256_pf1");
+        assert_eq!(combine.plugin, "saber_attn");
+        assert_eq!(combine.grid, [2 * 16 * 12, 1, 1]);
+        assert_eq!(combine.workspaces[0].bytes, bytes);
+        assert_eq!(combine.kernarg_bytes, 144);
+        assert!(saber::attn_decode_declc(s, &r).is_err());
+
+        // Every refusal below would otherwise give a plausible but incorrect descriptor.
+        for bad in [
+            AttnShape { live_rows: 15, ..s },
+            AttnShape {
+                ragged_rows: 30,
+                ..s
+            },
+            AttnShape { q_heads: 10, ..s },
+            AttnShape { head_dim: 128, ..s },
+            AttnShape {
+                block_size: 32,
+                ..s
+            },
+            attn(2, 15, 8192),
+            attn(2, 17, 8192),
+        ] {
+            assert!(resolve(Op::AttnDecode, Shape::Attn(bad), &r).is_err());
+        }
+        let mut small = r.clone();
+        small
+            .workspace
+            .get_mut("attn_decode_scratch")
+            .unwrap()
+            .capacity_bytes = bytes - 1;
+        assert!(resolve(Op::AttnDecode, Shape::Attn(s), &small).is_err());
+        assert!(saber::attn_decode_combine(s, &small).is_err());
+        let mut pf32 = r.clone();
+        pf32.knobs.combine_partial_f16 = false;
+        assert!(resolve(Op::AttnDecode, Shape::Attn(s), &pf32).is_err());
+        assert!(saber::attn_decode_combine(s, &pf32).is_err());
+
+        // An incorrect table pointing W16 back to a narrow symbol still has its 64-row guard.
+        let mut narrow = r.clone();
+        for row in &mut narrow.attn_decode {
+            row.symbol = row.symbol.replace("_uniform16", "").replace("_nw6", "_nw4");
+        }
+        assert!(resolve(Op::AttnDecode, Shape::Attn(s), &narrow)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds the 64"));
     }
 }
 

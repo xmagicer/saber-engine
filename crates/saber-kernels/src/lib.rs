@@ -308,6 +308,10 @@ pub mod prebuilt {
             "saber_attn.hsaco",
             "saber_attn_prefill_h256_gqa6_fp8kv_qk8pv8",
         ),
+        (
+            "saber_attn16.hsaco",
+            "saber_attn_decode_uniform16_h256_gqa6_fp8kv_nw6",
+        ),
         // The RAGGED decode attention (workstream C2): rx6's decode kernel and combine with each
         // sequence's query length read from `cu_q` (the retired source generator RAGGED_SUBS). Its
         // own code object, so `saber_attn` keeps rx6's bytes.

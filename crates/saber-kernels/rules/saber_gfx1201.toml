@@ -198,6 +198,33 @@ constraints = [
   { key = "kv_dtype", op = "in", sval = "bf16" },
 ]
 
+## Six-wave uniform causal decode: 16 query positions x GQA 6.
+[[registry]]
+op = "attn_decode_paged"
+entry = "attn_decode_uniform16_h256_gqa6_fp8kv"
+constraints = [
+  { key = "head_dim", op = "eq", ival = 256 },
+  { key = "gqa", op = "eq", ival = 6 },
+  { key = "block_size", op = "eq", ival = 16 },
+  { key = "causal", op = "eq", ival = 1 },
+  { key = "q_len", op = "eq", ival = 16 },
+  { key = "q_dtype", op = "in", sval = "bf16" },
+  { key = "kv_dtype", op = "in", sval = "fp8_e4m3" },
+]
+
+[[registry]]
+op = "attn_decode_paged"
+entry = "attn_decode_uniform16_h256_gqa6_bf16kv"
+constraints = [
+  { key = "head_dim", op = "eq", ival = 256 },
+  { key = "gqa", op = "eq", ival = 6 },
+  { key = "block_size", op = "eq", ival = 16 },
+  { key = "causal", op = "eq", ival = 1 },
+  { key = "q_len", op = "eq", ival = 16 },
+  { key = "q_dtype", op = "in", sval = "bf16" },
+  { key = "kv_dtype", op = "in", sval = "bf16" },
+]
+
 [[registry]]
 op = "gdn_fused_update"
 entry = "gdn_fused_update_w4k128v128_bf16"
@@ -414,6 +441,16 @@ symbol = "saber_attn_decode_h256_gqa6_bf16kv_nw3"
 entry = "attn_decode_h256_gqa6_bf16kv"
 nw = 4
 symbol = "saber_attn_decode_h256_gqa6_bf16kv_nw4"
+
+[[attn_decode]]
+entry = "attn_decode_uniform16_h256_gqa6_fp8kv"
+nw = 6
+symbol = "saber_attn_decode_uniform16_h256_gqa6_fp8kv_nw6"
+
+[[attn_decode]]
+entry = "attn_decode_uniform16_h256_gqa6_bf16kv"
+nw = 6
+symbol = "saber_attn_decode_uniform16_h256_gqa6_bf16kv_nw6"
 
 ## The split-KV combine, launched by the same entry point as the decode kernel. It is the SECOND
 ## launch of the decode op, which is why attn_decode declares n_launches = 2.
