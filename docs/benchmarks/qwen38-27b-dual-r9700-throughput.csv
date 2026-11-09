@@ -1,0 +1,67 @@
+experiment,arm,workload,requests,mean_request_tok_s,median_request_tok_s,max_request_tok_s,mean_of_request_1s_peaks_tok_s,max_rolling_1s_tok_s,request_0_tok_s,request_1_tok_s,request_2_tok_s
+Original vLLM-MX,control,code,3,185.79,185.36,189.82,,,189.82,182.2,185.36
+Original vLLM-MX,control,prose,3,133.9,136.47,145.61,,,136.47,145.61,119.62
+Current Saber V9,production,code,3,200.66,201.5,204.15,257.33,266,204.15,196.32,201.5
+Current Saber V9,production,prose,3,158.2,157.31,161.23,191.33,200,157.31,156.07,161.23
+Quark + Tandem B8,8 active slots,code,3,224.69,223.68,229.86,306.67,322,229.86,223.68,220.54
+Quark + Tandem B8,8 active slots,prose,3,164.51,164.64,166.66,201.67,211,166.66,164.64,162.23
+Quark + B32-trained draft,16-row verification,code,3,229.18,235.67,236.24,346,363,235.67,236.24,215.63
+Quark + B32-trained draft,16-row verification,prose,3,143.65,146.17,150.6,180,185,134.17,150.6,146.17
+Tandem B16 private A/B,before,code,3,215.48,217.55,228.27,,,228.27,217.55,200.62
+Tandem B16 private A/B,before,prose,3,147.13,145.28,153.4,,,145.28,142.73,153.4
+Tandem B16 private A/B,learned CPU ranking,code,3,215.13,228.09,235.69,,,181.61,228.09,235.69
+Tandem B16 private A/B,learned CPU ranking,prose,3,160.96,155.59,175.52,,,155.59,175.52,151.77
+Tandem B16 private A/B,after,code,3,214.45,216.41,227.42,,,227.42,216.41,199.51
+Tandem B16 private A/B,after,prose,3,146.04,153.37,154.66,,,130.09,154.66,153.37
+DSpine INT2 filtering,before,code,3,210.67,205.97,227.9,,,227.9,205.97,198.13
+DSpine INT2 filtering,before,prose,3,137.19,138.77,141.91,,,130.89,138.77,141.91
+DSpine INT2 filtering,stable ties,code,3,208.87,206.71,226.95,,,226.95,206.71,192.94
+DSpine INT2 filtering,stable ties,prose,3,136.11,136.86,142.64,,,128.81,136.86,142.64
+DSpine INT2 filtering,two GPU shards,code,3,212.84,211.28,229.3,,,229.3,211.28,197.95
+DSpine INT2 filtering,two GPU shards,prose,3,139.03,140.48,145.24,,,131.38,140.48,145.24
+DSpine INT2 filtering,head graph,code,3,207.14,203.38,223.71,,,223.71,203.38,194.31
+DSpine INT2 filtering,head graph,prose,3,135.93,137.81,141.21,,,128.77,137.81,141.21
+DSpine INT2 filtering,after,code,3,209.63,204.57,227.93,,,227.93,204.57,196.4
+DSpine INT2 filtering,after,prose,3,136.57,138.2,142.54,,,128.98,138.2,142.54
+DSpine short chain,8 rows before,code,3,169.12,164.4,178.59,,,178.59,164.36,164.4
+DSpine short chain,8 rows before,prose,3,121.46,120.35,125.79,,,125.79,120.35,118.25
+DSpine short chain,"3 rows, full head",code,3,107.72,109.34,109.61,,,109.61,109.34,104.2
+DSpine short chain,"3 rows, full head",prose,3,94.08,93.99,96.63,,,96.63,93.99,91.61
+DSpine short chain,"3 rows, trimmed head",code,3,109.39,110.39,110.97,,,110.39,110.97,106.81
+DSpine short chain,"3 rows, trimmed head",prose,3,95.73,97.78,98.15,,,98.15,97.78,91.26
+DSpine short chain,"4 rows, full head",code,3,133.88,134.82,135.52,,,131.31,135.52,134.82
+DSpine short chain,"4 rows, full head",prose,3,106.55,107.19,109.38,,,103.08,107.19,109.38
+DSpine short chain,"4 rows, trimmed head",code,3,134.83,135.03,136.34,,,133.13,135.03,136.34
+DSpine short chain,"4 rows, trimmed head",prose,3,109.52,110.64,111.15,,,106.78,110.64,111.15
+DSpine short chain,8 rows after,code,3,172.25,173.55,176.56,,,176.56,173.55,166.63
+DSpine short chain,8 rows after,prose,3,121.24,121.06,124.11,,,124.11,121.06,118.57
+DSpine full vocabulary A/B,INT2 before,code,3,208.09,206.17,222.8,,,222.8,206.17,195.31
+DSpine full vocabulary A/B,INT2 before,prose,3,136.14,137.54,141.5,,,129.37,137.54,141.5
+DSpine full vocabulary A/B,FP8 32 per shard,code,3,224.87,225.54,225.56,,,223.51,225.54,225.56
+DSpine full vocabulary A/B,FP8 32 per shard,prose,3,135.67,136.07,137.1,,,136.07,137.1,133.84
+DSpine full vocabulary A/B,INT2 after,code,3,208.07,205.37,223.36,,,223.36,205.37,195.48
+DSpine full vocabulary A/B,INT2 after,prose,3,135.95,137.25,142.04,,,128.57,137.25,142.04
+DSpine final-source A/B,before,code,3,208.92,204.7,224.34,,,224.34,204.7,197.72
+DSpine final-source A/B,before,prose,3,132.29,135.91,141.27,,,119.67,135.91,141.27
+DSpine final-source A/B,two GPU shards,code,3,206.98,208.39,226.94,,,226.94,208.39,185.6
+DSpine final-source A/B,two GPU shards,prose,3,138.0,140.0,141.54,,,132.47,140.0,141.54
+DSpine final-source A/B,after,code,3,207.51,202.32,223.73,,,223.73,202.32,196.47
+DSpine final-source A/B,after,prose,3,135.69,136.11,142.06,,,128.88,136.11,142.06
+DSpine CPU parallel online,buffered-a,code,3,213.32,210.74,229.3,308.67,320,229.3,210.74,199.93
+DSpine CPU parallel online,buffered-a,prose,3,139.06,140.78,144.08,169.67,180,132.33,140.78,144.08
+DSpine CPU parallel online,buffered-b,code,3,210.91,206.81,229.43,304,320,229.43,206.81,196.48
+DSpine CPU parallel online,buffered-b,prose,3,138.25,139.6,144.95,168.33,180,130.2,139.6,144.95
+DSpine CPU parallel online,cpu64,code,3,210.9,207.21,229.63,301.33,312,229.63,207.21,195.86
+DSpine CPU parallel online,cpu64,prose,3,138.44,140.68,144.25,169.67,180,130.38,140.68,144.25
+DSpine CPU parallel online,stock-a,code,3,211.51,209.59,228.65,304,320,228.65,209.59,196.28
+DSpine CPU parallel online,stock-a,prose,3,137.53,139.36,143.12,165,177,130.1,139.36,143.12
+DSpine CPU parallel online,stock-b,code,3,213.45,212.63,226.27,309,331,226.27,212.63,201.46
+DSpine CPU parallel online,stock-b,prose,3,138.17,139.72,143.35,166.67,180,131.42,139.72,143.35
+Original vLLM-MX,300W stream-timing rerun,code,3,185.75,185.32,189.75,261,279,189.75,182.19,185.32
+Original vLLM-MX,300W stream-timing rerun,prose,3,133.93,136.52,145.62,189.33,221,136.52,145.62,119.64
+"Public Saber CLI, Quark + Tandem B16",CPU calibrated,code,3,229.09,227.63,235.65,333,345,224.0,227.63,235.65
+"Public Saber CLI, Quark + Tandem B16",CPU calibrated,prose,3,161.19,156.06,175.81,219.67,304,156.06,175.81,151.69
+"Public Saber CLI, Quark + Tandem B16",stock-a,code,3,214.31,216.15,227.13,308.67,350,227.13,216.15,199.65
+"Public Saber CLI, Quark + Tandem B16",stock-a,prose,3,150.82,153.46,154.09,175.33,178,144.91,154.09,153.46
+"Public Saber CLI, Quark + Tandem B16",stock-b,code,3,215.17,216.1,228.69,308.67,350,228.69,216.1,200.73
+"Public Saber CLI, Quark + Tandem B16",stock-b,prose,3,151.41,153.78,154.84,175.33,178,145.62,154.84,153.78

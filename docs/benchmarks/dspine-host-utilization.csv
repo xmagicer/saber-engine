@@ -1,0 +1,11 @@
+experiment,arm,workload,samples_0.5s,host_cpu_percent_mean,host_cpu_percent_max,host_cpu_percent_min,p_logical_percent_mean,p_logical_percent_max,p_logical_percent_min,e_core_percent_mean,e_core_percent_max,e_core_percent_min,mem_available_gib_mean,mem_available_gib_max,mem_available_gib_min,gpu_w0_mean,gpu_w0_max,gpu_w0_min,gpu_w1_mean,gpu_w1_max,gpu_w1_min
+CPU parallel online,stock-a,code,30,11.28,12.14,10.91,17.93,18.83,16.56,1.31,4.73,0.0,77.66,77.81,77.52,251.93,257.0,236.0,252.63,259.0,236.0
+CPU parallel online,stock-a,prose,45,11.27,12.25,10.74,17.86,19.27,15.94,1.39,5.68,0.0,77.93,77.97,77.85,259.02,264.0,251.0,261.51,268.0,254.0
+CPU parallel online,buffered-a,code,29,11.24,12.11,10.72,17.9,19.1,15.08,1.25,4.49,0.0,77.85,77.89,77.8,258.79,265.0,243.0,260.97,268.0,241.0
+CPU parallel online,buffered-a,prose,45,11.34,12.2,10.84,17.92,19.6,16.22,1.48,4.01,0.0,77.92,77.94,77.89,266.58,272.0,259.0,269.24,275.0,261.0
+CPU parallel online,cpu64,code,30,11.47,12.32,11.02,17.95,19.26,15.35,1.79,6.23,0.25,75.32,75.43,75.11,255.97,262.0,238.0,257.7,265.0,235.0
+CPU parallel online,cpu64,prose,45,11.5,12.24,11.03,18.35,19.4,16.84,1.21,3.27,0.0,75.51,75.55,75.45,265.42,271.0,258.0,268.16,275.0,260.0
+CPU parallel online,buffered-b,code,30,11.23,12.02,10.81,17.53,18.7,15.8,1.81,4.46,0.25,77.74,77.8,77.67,257.57,265.0,239.0,259.23,267.0,241.0
+CPU parallel online,buffered-b,prose,45,11.3,12.34,10.92,17.87,18.97,16.28,1.47,4.76,0.0,77.88,77.91,77.82,266.87,274.0,256.0,268.76,277.0,258.0
+CPU parallel online,stock-b,code,30,11.24,12.51,10.53,17.97,19.26,15.1,1.2,5.22,0.0,77.57,77.68,77.44,260.43,269.0,232.0,261.27,269.0,234.0
+CPU parallel online,stock-b,prose,44,11.27,12.32,10.64,17.85,18.97,16.22,1.44,3.99,0.0,77.74,77.79,77.68,267.36,273.0,261.0,269.27,276.0,261.0

@@ -176,3 +176,9 @@ TIER=qwen38-27b-quark-matched-core-fp8head DRAFT=qwen38-dflash2-tandem-b16-fp8he
 | 预分配全 GPU，后测 | 长文 | 138.25 | 139.60 | 144.95 | 180 |
 
 CPU/GPU 协同精排缩短了局部阶段的时间。此次整请求平均速度与全 GPU 对照接近，线上继续使用原有配置。
+
+### 完整统计表
+
+吞吐表保留每类的三个整请求速率、算术平均、中位及最高值。带逐帧 ID 的测试另外记录每条流最高一秒交付量的平均和最大值。历史流缺少单调时钟时间戳，对应的一秒峰值留空。[同六请求吞吐和峰值](benchmarks/qwen38-27b-dual-r9700-throughput.csv)
+
+CPU 表区分完整提案和候选就绪到交付提案两个计时边界。占用率和功率按 0.5 秒采样，截取各请求的实际执行区间；CPU 百分比和可用内存来自整台主机。目标验算表按完整图计算算子耗时。[CPU 草稿与协同精排延迟](benchmarks/dspine-cpu-latency.csv) · [在线 CPU 使用率、内存与双卡功率](benchmarks/dspine-host-utilization.csv) · [目标模型逐轮验算时长](benchmarks/qwen38-27b-target-verify.csv)
