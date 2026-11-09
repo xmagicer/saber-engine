@@ -130,3 +130,12 @@ class RingDraft:
         if slot is not None:
             slot.reset()
             self.free.append(slot)
+
+    def close(self):
+        """Release captured graph executables before their TP communicator."""
+        for slot in [*self.slots.values(), *self.free]:
+            for bucket in slot.graphs.values():
+                bucket.graph.reset()
+            slot.graphs.clear()
+        self.slots.clear()
+        self.free.clear()

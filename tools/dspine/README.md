@@ -167,3 +167,21 @@ set `WIDTHS=1,8` and omit `--gpu-tree`. The JSON response and the shutdown tree
 counters together verify a live request and actual tree selection. Stop the
 experiment with `docker stop dspine-target dspine-draft` and restore the managed
 launcher before checking gateway health.
+
+### Two-GPU candidate filtering
+
+Add `--tp-sparse-head` to the `tools/dspine/tp_service.py` command to scan each INT2 vocabulary shard on its owning GPU. Both draft ranks already have the final hidden rows. The follower sends 80 candidate IDs per row to the leader (4,800 bytes for 15 rows). The leader recomputes the scores of all 160 candidates per row before selecting the final 16. Truncating to 16 during the INT2 filter can discard a high-scoring token. The target server command is the same for both modes.
+
+On dual R9700, using the matched Quark target and a 15-node DSpine tree, two leader-only controls measured 205.97/138.77 and 204.57/138.20 tok/s (code/prose). The sharded candidate filter measured 211.28/140.48 tok/s. All six 1,024-token responses, draft round counts and accepted-token counts matched. Over eight additional captured positions the median interval from draft hidden rows to a consumable proposal decreased from 1.53 ms to 1.12 ms.
+
+The release-source repeat used the same six fixed requests. Each mean, median and maximum below summarizes the per-request decode rates of the three requests in that category. The maximum is the fastest whole request.
+
+| DSpine mode | Code mean | Code median | Code max | Prose mean | Prose median | Prose max |
+|---|---:|---:|---:|---:|---:|---:|
+| Leader-only control, before | 208.92 | 204.70 | 224.34 | 132.29 | 135.91 | 141.27 |
+| Two-shard INT2 | 206.98 | 208.39 | 226.94 | 138.00 | 140.00 | 141.54 |
+| Leader-only control, after | 207.51 | 202.32 | 223.73 | 135.69 | 136.11 | 142.06 |
+
+All six output hashes and speculative counters matched across these three arms. A separate stop test warmed the teacher ring, submitted a real 15-node proposal and released the session. Both workers freed the HIP graphs in active and reusable slots before closing their process groups. Docker stopped the service in 1.10 s. The torchrun launcher returned 1 after receiving SIGTERM. Earlier stops reached the 25 s timeout and exited with 137 after SIGKILL.
+
+The corresponding RTX 3090 results use a Q4_K_M target, CUDA and a different set of prompts. The author measured 7.6 tokens per verification step for code and 2.5 for story writing. Tencent's WorkBuddy throughput is total output across eight concurrent requests. [RTX 3090 benchmark settings](https://huggingface.co/aj9o9/Qwen3.8-27B-DSpine-b16-GGUF#benchmarks) · [Tencent evaluation](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16#evaluation).

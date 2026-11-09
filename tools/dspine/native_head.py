@@ -22,25 +22,34 @@ def exact_candidate_topk(hidden,head,pool,k=16):
 
 class NativeSparseHead:
     """Use the shipped gfx1201 int2 head code object on a PyTorch HIP stream."""
-    def __init__(self,drafter_directory,prebuilt,device=0):
+    def __init__(self,drafter_directory,prebuilt,device=0,*,shard_rank=None):
         self.module=hip_module.HipModule(prebuilt,'dflash_head',device)
         self.device=device;self.shards=[];self.vocab=0;self.hidden=5120
         root=Path(drafter_directory);manifest=json.loads((root/'manifest.json').read_text())
-        for shard in sorted(manifest['ranks'],key=lambda s:s['rank']):
+        shards=sorted(manifest['ranks'],key=lambda s:s['rank'])
+        if shard_rank is not None and (shard_rank not in (0,1) or [s['rank'] for s in shards]!=[0,1]):
+            raise ValueError('Sharded candidate lookup requires two ordered vocabulary shards')
+        self.shard_rank=shard_rank
+        for shard in shards:
             path=root/shard['file']
             if shard['file']!=f"rank{shard['rank']}.pack" or path.stat().st_size!=shard['file_bytes']:raise ValueError('Unexpected drafter shard')
-            mapped=torch.from_file(str(path),shared=False,size=shard['file_bytes'],dtype=torch.uint8);records={x['name']:x for x in shard['records']}
+            records={x['name']:x for x in shard['records']}
+            base=self.vocab
+            self.vocab+=records['head.int2.wq']['shape'][0]
+            if shard_rank is not None and shard['rank']!=shard_rank:
+                continue
+            mapped=torch.from_file(str(path),shared=False,size=shard['file_bytes'],dtype=torch.uint8)
             wq=pack_io.TargetPack.record(mapped,records['head.int2.wq'],torch.uint8,9).to(device=f'cuda:{device}')
             s=pack_io.TargetPack.record(mapped,records['head.int2.s'],torch.bfloat16,10).to(device=f'cuda:{device}')
             zs=pack_io.TargetPack.record(mapped,records['head.int2.zs'],torch.bfloat16,11).to(device=f'cuda:{device}')
             n=wq.shape[0]
             if wq.shape[1]!=self.hidden//4 or s.shape!=(n,self.hidden//128) or zs.shape!=s.shape or n%64:raise ValueError('Int2 head shape mismatch')
-            self.shards.append({'base':self.vocab,'n':n,'wq':wq,'s':s,'zs':zs});self.vocab+=n
+            self.shards.append({'base':base,'n':n,'wq':wq,'s':s,'zs':zs})
 
     @torch.no_grad()
-    def candidates(self,hidden,head,k=16,pool_per_shard=256,coarse_mode="block"):
+    def coarse_pools(self,hidden,pool_per_shard=256,coarse_mode="block"):
+        """Return coarse pools for the loaded vocabulary shards using global token IDs."""
         import canonical_coarse
-
         if coarse_mode not in ["block","dense"]:raise ValueError("Unknown coarse candidate mode")
         if hidden.ndim!=2 or hidden.shape[1]!=self.hidden or hidden.dtype!=torch.bfloat16 or not hidden.is_cuda:raise ValueError('Expected CUDA BF16 hidden rows')
         live=hidden.shape[0];rows=max(16,1<<(live-1).bit_length())
@@ -64,4 +73,11 @@ class NativeSparseHead:
             else:
                 positions=canonical_coarse.positions(maxima[:live],indices[:live],pool_per_shard)
                 pools.append(torch.gather(indices[:live].long(),1,positions)+shard['base'])
+        return pools
+
+    @torch.no_grad()
+    def candidates(self,hidden,head,k=16,pool_per_shard=256,coarse_mode="block"):
+        if self.shard_rank is not None:
+            raise ValueError('Merge both ranks before exact candidate ranking')
+        pools=self.coarse_pools(hidden,pool_per_shard,coarse_mode)
         return exact_candidate_topk(hidden,head,torch.cat(pools,dim=-1),k)
