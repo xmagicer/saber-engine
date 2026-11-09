@@ -130,7 +130,15 @@ container shutdowns exited successfully. No kernel or boot configuration changed
 sequence. Its state advance uses the 16-row record layout. The target can also
 plan a six-wave uniform causal kernel at exactly 16 queries for GQA 6, head size
 256 and a 16-token page. Chain and tree captures have separate identities on
-both TP ranks. Worker wire version 17 requires matched binaries.
+both TP ranks. Worker wire version 18 exchanges each rank's memory measurements at boot and requires matching binaries.
+
+The native server publishes `saber:resident_weight_bytes` and
+`saber:kv_pool_allocated_bytes` on `/metrics`. Each rank reports its own weight
+tensor payloads and total target and draft K/V allocations. Shared weights
+count once per physical upload. The weight gauge excludes RoPE tables and
+padding. The K/V gauge includes free and reserved pages without GDN state or
+graph scratch. The optional `pci_bdf` label identifies the device selected by
+HIP on that rank.
 
 The experimental DSpine socket backend consumes verified target features and
 returns chain or 15-node proposals. In the tested matched-Quark configuration

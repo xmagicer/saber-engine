@@ -1987,6 +1987,11 @@ impl<R: ForwardRunner> RealExecutor<R> {
 }
 
 impl<R: ForwardRunner> StepExecutor for RealExecutor<R> {
+    fn memory_plane(&self) -> Option<std::sync::Arc<std::sync::Mutex<String>>> {
+        let text = &self.forward.facts().rank_memory_plane;
+        (!text.is_empty()).then(|| std::sync::Arc::new(std::sync::Mutex::new(text.clone())))
+    }
+
     fn census_mirror(&self) -> Option<std::sync::Arc<saber_serve::census::CensusMirror>> {
         Some(std::sync::Arc::clone(&self.census))
     }

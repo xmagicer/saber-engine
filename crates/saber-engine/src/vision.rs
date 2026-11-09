@@ -123,6 +123,8 @@ pub struct VisionTier<'h> {
     pub records: usize,
     /// Weight bytes resident (the upload arena).
     pub weight_bytes: u64,
+    /// Resident vision weight tensor bytes, excluding the upload arena's padding.
+    pub weight_payload_bytes: u64,
     /// Seconds the upload took.
     pub upload_s: f64,
     /// The resident form's device memory; `None` for the streamed form (P27-11), which owns none.
@@ -267,7 +269,9 @@ pub fn boot_vision_in<'h>(
     }
     .map_err(|x| ForwardError::Device(format!("vision: the sink: {x}")))?;
     let mut addr: BTreeMap<String, DeviceAddr> = BTreeMap::new();
+    let mut weight_payload_bytes = 0;
     up.run(&mut sink, &ring, |r| {
+        weight_payload_bytes += r.len;
         addr.insert(r.name.to_string(), r.addr);
     })
     .map_err(|x| ForwardError::Device(format!("vision: uploading the tower: {x}")))?;
@@ -280,6 +284,7 @@ pub fn boot_vision_in<'h>(
         exec,
         records,
         weight_bytes: uplan.arena_bytes,
+        weight_payload_bytes,
         upload_s: t0.elapsed().as_secs_f64(),
         _sink: Some(sink),
     })
@@ -369,6 +374,7 @@ pub fn boot_vision_streamed<'h>(
         exec,
         records: records.len(),
         weight_bytes: 0,
+        weight_payload_bytes: 0,
         upload_s: t0.elapsed().as_secs_f64(),
         _sink: None,
     })

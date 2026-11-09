@@ -1130,6 +1130,7 @@ type MixedReply = (
 
 mod canary;
 mod fused;
+mod memory;
 mod shadow;
 
 fn engine_graph(cfg: &EngineConfig, width: u32) -> Result<Graph, saber_model::ModelError> {
@@ -6191,8 +6192,10 @@ fn run(
     let ring = PinnedRing::new(&mut staging, &reserved).map_err(device_err("the staging ring"))?;
     let mut sink = HipSink::new(hip, &reserved).map_err(device_err("the upload sink"))?;
     let mut weights: BTreeMap<String, BoundWeight> = BTreeMap::new();
+    let mut resident_weight_bytes = 0;
     let stats = upload
         .run(&mut sink, &ring, |r| {
+            resident_weight_bytes += memory::weight_payload(r.name, r.len);
             if let Some(layout) = layout_of.get(r.name) {
                 weights.insert(r.name.to_string(), BoundWeight::new(r.addr, *layout));
             }
@@ -7639,6 +7642,7 @@ fn run(
                 HipSink::new(hip, &reserved).map_err(device_err("the drafter's sink"))?;
             let stats = up
                 .run(&mut sink, &ring, |r| {
+                    resident_weight_bytes += memory::weight_payload(r.name, r.len);
                     addr.insert(r.name.to_string(), r.addr);
                 })
                 .map_err(device_err("uploading the drafter"))?;
@@ -8721,6 +8725,45 @@ fn run(
         }
     }
 
+    // External draft workers own additional GPU memory outside this process.
+    // Publish only complete rank measurements for native boots.
+    let draft_kv = drafter.as_ref().map_or(Some(0), |r| {
+        memory::draft_kv_bytes(&r.named, |i| r.bufs.get(i).map(DevicePtr::len))
+    });
+    let local_memory = draft_kv.filter(|_| !dspine).map(|draft_kv| {
+        let target_kv: u64 = state_bufs
+            .iter()
+            .filter(|b| b.per_slot.is_none())
+            .map(|b| b.ptr.len())
+            .sum();
+        memory::RankMemory {
+            rank: cfg.rank,
+            pci_bdf: hip
+                .device_pci_bus_id(cfg.device)
+                .ok()
+                .filter(|s| !s.is_empty()),
+            resident_weight_bytes: resident_weight_bytes
+                + vision.as_ref().map_or(0, |v| v.weight_payload_bytes),
+            kv_pool_allocated_bytes: target_kv + draft_kv,
+        }
+    });
+    let mut rank_memory = Vec::new();
+    if let Some(peer) = &peer {
+        let frame = serde_json::to_vec(&local_memory).map_err(device_err("encoding rank memory"))?;
+        let received = peer
+            .exchange()
+            .xchg_bytes("engine.rank-memory", &frame)
+            .map_err(|e| ForwardError::Peer(e.to_string()))?;
+        let other: Option<memory::RankMemory> = serde_json::from_slice(&received)
+            .map_err(|e| ForwardError::Peer(format!("decoding rank memory: {e}")))?;
+        if other.as_ref().is_some_and(|m| m.rank != peer.peer_rank()) {
+            return Err(ForwardError::Peer(
+                "rank memory came from the wrong rank".into(),
+            ));
+        }
+        rank_memory.extend(other);
+    }
+    rank_memory.extend(local_memory);
     let device_bytes = budget_at_start.saturating_sub(budget);
 
     phases.record(
@@ -8885,6 +8928,7 @@ fn run(
         attention_interval: graph.config.full_attention_interval,
         vocab,
         weights: inputs.weights.len(),
+        rank_memory_plane: memory::render(&mut rank_memory),
         supplied: supplied.into_iter().collect(),
         device_bytes,
         kv_pool_blocks,

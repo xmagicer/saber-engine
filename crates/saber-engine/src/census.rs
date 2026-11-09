@@ -778,7 +778,8 @@ pub fn shutdown_census(
         format!(
             "steps {}, idle {}, no bucket {}, protocol errors {}, token count errors {}, aborts \
              running {} / waiting {} / parked {}, finished stop {} / length {}, results for gone \
-             seqs {}, retires deferred {}, prefill steps {}, prefill bucket misses {}, vision \
+             seqs {}, retires deferred {}, prefill steps {}, computed prompt tokens {}, \
+             committed output tokens {}, prefill bucket misses {}, vision \
              waits {}, forks \
              pending {} / done {} / failed {} / orphaned {}, fork first-token logprobs absent {}, \
              slot caps absorbed {}, width narrowed steps {}, width raised to a previous \
@@ -797,6 +798,8 @@ pub fn shutdown_census(
             sc.results_for_gone_sequences,
             sc.retires_deferred,
             sc.prefill_steps,
+            sc.prefill_computed_tokens,
+            sc.output_committed_tokens,
             sc.prefill_bucket_misses,
             sc.vision_waits,
             sc.forks_pending,
@@ -977,6 +980,8 @@ mod tests {
                 results_for_gone_sequences,
                 retires_deferred,
                 prefill_steps,
+                prefill_computed_tokens,
+                output_committed_tokens,
                 prefill_bucket_misses,
                 vision_waits,
                 forks_pending,
