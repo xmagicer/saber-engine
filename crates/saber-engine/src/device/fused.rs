@@ -838,27 +838,6 @@ pub(super) fn fused_step(
         band_width: None,
     };
     let live_rows_total: usize = slots.iter().map(|s| s.rows() as usize).sum();
-    // P12/P13's law on the step: no page and no GDN set shared between two chunks or between a
-    // chunk and a decode row (two decode rows MAY share read-only prompt pages: the branches of
-    // an `n > 1` fork), and every GDN set distinct.
-    {
-        let chunk_state: Vec<saber_sched::mixed_law::RowState<'_>> = cfacts
-            .iter()
-            .map(|(slot, _, blocks)| saber_sched::mixed_law::RowState {
-                kv_blocks: blocks,
-                gdn_set: *slot,
-            })
-            .collect();
-        let dec_state: Vec<saber_sched::mixed_law::RowState<'_>> = facts
-            .iter()
-            .map(|(slot, _, blocks, _)| saber_sched::mixed_law::RowState {
-                kv_blocks: blocks,
-                gdn_set: *slot,
-            })
-            .collect();
-        saber_sched::mixed_law::isolated_packed(&chunk_state, &dec_state)
-            .map_err(|e| ForwardError::Device(format!("the fused step is not isolated: {e}")))?;
-    }
     // ---- the combined ids: every chunk's rows, then the decode rows, then zeros ----------------
     let mut ids: Vec<TokenId> = chunks
         .iter()
@@ -879,6 +858,20 @@ pub(super) fn fused_step(
             }]
         })
         .collect();
+    // Check the actual cursors and tables used by the paged append, before either
+    // rank submits GPU work. Padding rows have no owning sequence or KV pages.
+    let live_seqs = cseqs.iter().map(|s| &s[0]).chain(&dseqs[..slots.len()]);
+    let accesses = live_seqs.map(|s| {
+        (
+            saber_sched::mixed_law::RowState {
+                kv_blocks: s.kv_blocks,
+                gdn_set: s.state_slot,
+            },
+            s.done_before,
+        )
+    });
+    saber_sched::mixed_law::isolated_at_cursors(accesses, saber_exec::forward::KV_BLOCK)
+        .map_err(|e| ForwardError::Device(format!("the fused step is not isolated: {e}")))?;
     // ---- the prefill rung, retargeted at chunk 0 (prefill_step's) ----------------------------
     let moved = plans[pre_ix]
         .plan

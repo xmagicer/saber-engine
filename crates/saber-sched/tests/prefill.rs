@@ -214,6 +214,9 @@ fn the_fill_rule_cuts_long_prompts_into_filled_rungs() {
 async fn a_short_prompt_is_one_prefill_chunk_then_decode() {
     let sched = sched_with(&PREFILL);
     let submission = sched.submit(request(234, 100)).expect("submit");
+    sched.step();
+    assert_eq!(sched.counters().prefill_computed_tokens, 234);
+    assert_eq!(sched.counters().output_committed_tokens, 1);
     sched.run_steps(200);
     let events = stream(submission).await;
 
@@ -248,6 +251,10 @@ async fn a_short_prompt_is_one_prefill_chunk_then_decode() {
     );
     assert_eq!(tokens_of(&events), answer());
     assert_eq!(sched.counters().prefill_steps, 1);
+    assert_eq!(
+        sched.counters().output_committed_tokens,
+        tokens_of(&events).len() as u64
+    );
     assert_eq!(sched.counters().prefill_bucket_misses, 0);
 }
 

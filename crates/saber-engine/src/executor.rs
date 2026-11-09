@@ -1437,22 +1437,10 @@ impl<R: ForwardRunner> RealExecutor<R> {
         self.drafter.offer(seq, &p.block);
     }
 
-    /// A step nothing could run: one zero-token result per slot, which the scheduler counts as a
-    /// protocol error and aborts, rather than tokens nothing produced.
-    fn failed(slots: &[BatchSlot]) -> StepResult {
-        StepResult {
-            seqs: slots
-                .iter()
-                .map(|s| SeqStep {
-                    seq_id: s.seq_id,
-                    tokens: Vec::new(),
-                    draft_tokens: 0,
-                    accepted_tokens: 0,
-                    logprobs: None,
-                    prompt_logprobs: None,
-                })
-                .collect(),
-        }
+    /// A failed forward produced no slot results. An empty token list *for* a slot would
+    /// acknowledge a successful non-final prefill chunk and advance its prompt cursor.
+    fn failed() -> StepResult {
+        StepResult::default()
     }
 
     /// One prefill chunk: one sequence, one chunk, a token only on the last.
@@ -1487,7 +1475,7 @@ impl<R: ForwardRunner> RealExecutor<R> {
             Err(e) => {
                 self.counters.forward_errors += 1;
                 tracing::error!(seq = %slot.seq_id, error = %e, "prefill chunk failed");
-                return Self::failed(std::slice::from_ref(slot));
+                return Self::failed();
             }
         };
         let forward_done = std::time::Instant::now();
@@ -1523,7 +1511,7 @@ impl<R: ForwardRunner> RealExecutor<R> {
                 // zero-token finish from looking like a stop.
                 self.counters.forward_errors += 1;
                 tracing::error!(seq = %slot.seq_id, "the last prefill chunk sampled nothing");
-                return Self::failed(std::slice::from_ref(slot));
+                return Self::failed();
             }
             (false, _) => (Vec::new(), None),
         };
@@ -1667,7 +1655,7 @@ impl<R: ForwardRunner> RealExecutor<R> {
                 bucket = %batch.bucket.label(),
                 "more live sequences than the bucket's batch"
             );
-            return Self::failed(batch.slots);
+            return Self::failed();
         }
         // THE DRAFT. The bucket's verify width is `w = k + 1` rows per sequence: row 0 feeds the
         // token the last step committed and rows `1..=k` feed the drafter's guesses. The drafter may
@@ -1811,7 +1799,7 @@ impl<R: ForwardRunner> RealExecutor<R> {
             Err(e) => {
                 self.counters.forward_errors += 1;
                 tracing::error!(error = %e, slots = slots.len(), width, "decode step failed");
-                return Self::failed(batch.slots);
+                return Self::failed();
             }
         };
         let forward_done = std::time::Instant::now();
@@ -1831,7 +1819,7 @@ impl<R: ForwardRunner> RealExecutor<R> {
         self.check_step(want, slots.len(), &out);
         if out.commits.len() != slots.len() {
             // `check_step` has already counted this; the stream must not be fed guesses.
-            return Self::failed(batch.slots);
+            return Self::failed();
         }
         // The commits come back in slot order and each one echoes its sequence, so a pass that
         // returned them permuted is a protocol error here rather than tokens on the wrong stream.
@@ -1849,7 +1837,7 @@ impl<R: ForwardRunner> RealExecutor<R> {
                 got = %bad,
                 "a decode step returned its commits out of slot order"
             );
-            return Self::failed(batch.slots);
+            return Self::failed();
         }
         for (s, c) in batch.slots.iter().zip(&out.commits) {
             self.drafter.commit(s.seq_id, &c.tokens);
@@ -2044,7 +2032,7 @@ impl<R: ForwardRunner> StepExecutor for RealExecutor<R> {
         {
             self.counters.unknown_sequences += 1;
             tracing::error!(seq = %unknown.seq_id, "a step for a sequence the engine never admitted");
-            return Self::failed(batch.slots);
+            return Self::failed();
         }
         match batch.phase {
             Phase::Prefill => match batch.slots {
@@ -2063,7 +2051,7 @@ impl<R: ForwardRunner> StepExecutor for RealExecutor<R> {
                         slots = other.len(),
                         "a prefill step with more than one sequence"
                     );
-                    Self::failed(batch.slots)
+                    Self::failed()
                 }
             },
             Phase::Decode => self.decode_step(batch),
