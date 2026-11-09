@@ -26,7 +26,7 @@ saber serve ... --engine-max-seqs 1 --enable-prefix-caching off --engine-spec-tr
 
 The checkpoint's `[1,16,31,46,61]` are **zero-based decoder output** ids. Saber's `lN.resid.a` is the residual entering layer N, so the actual capture points are **`[2,17,32,47,62]`**. `target_layers.py` performs this mapping and rejects captures using the unshifted list. Do not apply this DSpine-specific convention to an older DFlash2 pack automatically. Capture uses an independently allocated plane so the resident DFlash2 proposal remains unchanged. Export directories/files use modes 0700/0600; existing directories are refused.
 
-Verified on a real gfx1201 GPU: upstream Triton bridge parity with the BF16 checkpoint, and no-future-feature replay against captured target outputs. The eager BF16 implementation takes about 16-17 ms per proposal on the tested setup; this is an acceptance experiment, not end-to-end serving throughput. It needs an optimized proposer before it can offer a serving speedup.
+Verified on a real gfx1201 GPU: upstream Triton bridge parity with the BF16 checkpoint, and no-future-feature replay against captured target outputs. Historical eager timing preceded the corrected layer and normalization checks and is superseded. Acceptance experiments and isolated proposal timing must not be presented as end-to-end serving throughput.
 
 Native group-128 W8A8 projections passed independent logical-matrix and varying-input graph checks. **Earlier acceptance measurements used the unshifted capture ids and are invalid as DSpine quality results.** The low-level numerical/causality checks remain useful, but acceptance must be remeasured with correctly captured decoder outputs. This work has not been adopted for serving.
 
@@ -44,4 +44,67 @@ With corrected layer mapping and SGLang backbone norm semantics, an offline refe
 
 Each cell is code / prose. Tree construction reads only proposer probabilities; canonical future tokens are supplied afterward to an independent acceptance walk. `tree_proposal.py` checks normalized conditional probabilities, parent-before-child rows and 16-bit ancestor masks. The optional full transition output in `reference.serial_table` is a slow correctness path, not a serving implementation.
 
-These corrected results are acceptance diagnostics, not three-prompt medians or live tok/s. TP=2 serving integration and corrected proposer latency measurement remain incomplete.
+These corrected results are acceptance diagnostics, not three-prompt medians or live tok/s. TP=2 serving integration remains incomplete; corrected isolated proposer timing is described below.
+
+
+## Corrected GPU proposal experiments
+
+`NativeChannelLinear(..., row_band=32)` selects the existing 32-row W8A16
+kernel and bounds stores by the actual number of rows. The default remains 16.
+On actual DSpine matrices at 8/16 rows, the 32-row form was about 1.6-2.0x
+faster for the larger projections and bit-identical in eager and changing-input
+graph tests. Whole proposals improved only about 3-5%; the 32-row int2 head was
+slower and was rejected.
+
+`triton_bridge.FusedBridge` can be assigned to `TorchDspine.bridge`. Its four
+fused kernels retain BF16 bridge projections and the bridge-specific two-round
+next-norm. Graph callers must retain the captured linear **and bridge** callback.
+In 12 corrected-input cases (code/prose, three teacher lengths, blocks 8/16),
+fusion saved approximately 0.8-1.0 ms per isolated proposal; final greedy drafts
+matched the reference in these cases, although intermediate BF16 states differed.
+Full saved-trajectory chain replay also retained reference acceptance for both
+NVFP4 and matched Quark target packs. A more aggressive native BF16 projection
+experiment slightly reduced Quark prose acceptance and was not selected.
+These are one-trajectory diagnostics, not a claim of reaching 300/200 tok/s.
+
+`triton_tail.py` computes serial greedy transitions, confidence and optionally
+normalized conditional log-probabilities on the GPU. Tree construction receives
+only those proposer outputs; target future tokens enter the acceptance walk
+after the tree has been built. CPU `reference.py` remains the independent oracle.
+Both physical gfx1201 GPUs passed changing-input graph checks at K=2/8/16/32;
+transition log-probability maximum error was below 2.3e-5 in that gate, and greedy
+indices/walks matched exactly.
+
+Reproduce the primitive GPU checks (one process per physical GPU):
+
+```sh
+HIP_VISIBLE_DEVICES=0 python3 tools/dspine/gpu_bridge_gate.py --checkpoint /models/Qwen3.8-27B-DSpine-b16
+HIP_VISIBLE_DEVICES=0 python3 tools/dspine/gpu_tail_gate.py --checkpoint /models/Qwen3.8-27B-DSpine-b16
+# Repeat with HIP_VISIBLE_DEVICES=1; each process still uses logical cuda:0.
+```
+
+Replay a real capture with a fresh private evidence file:
+
+```sh
+python3 tools/dspine/offline_replay.py \
+  --capture /evidence/correct-target-capture \
+  --checkpoint /models/Qwen3.8-27B-DSpine-b16 \
+  --target-pack /packs/qwen38-27b-nvfp4-devfinal-fp8head \
+  --draft-pack /packs/qwen38-dflash2-drafter-fp8head \
+  --prebuilt prebuilt/gfx1201 --projection channel --row-band 32 \
+  --fused-bridge --block-size 16 --tree-nodes 15 --max-depth 15 \
+  --output /evidence/new-tree-result.json
+```
+
+Use `--tree-nodes 0` for the chain control, omit `--fused-bridge` for the
+unfused control, or select `--candidate-pool 0 --projection bf16` for the dense
+BF16 control. The int2 pool and FP8 projections are experimental approximations;
+target verification is unchanged. Saved output includes per-round proposals and
+acceptance; it refuses overwriting an existing evidence file. No serving wrapper
+or production model selection is changed by these utilities.
+
+The standalone CLI passed six actual capture runs (NVFP4/Quark, chain control,
+unfused tree and fused tree), each covering the saved code and prose trajectory.
+The GPU tree results reproduced the CPU-reference means above, and bridge fusion
+retained those means in both target variants. This validates the offline path;
+it does not establish TP=2 serving performance or 300/200 tok/s.

@@ -4,3 +4,8 @@ https://github.com/Tencent/DSpine
 and SGLang v0.5.22 (dflash.py / dflash_utils.py).
 Upstream implementations are distributed under the Apache License, Version 2.0.
 See LICENSE in this directory. Arithmetic attribution is also retained in source files.
+
+triton_bridge.py and triton_tail.py contain adapted Tencent DSpine Triton kernels.
+Local extensions add validated bridge injection and optional normalized transition
+log-probabilities for best-first proposal trees. Copyright (C) 2026 Tencent applies
+to the upstream portions; modifications retain Apache-2.0 licensing.

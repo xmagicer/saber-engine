@@ -3,7 +3,7 @@
 Teacher caches stay in TorchDspine. Graph staging takes a copy of committed
 teacher rows only, with explicitly invalid positions in padded slots. No draft
 query K/V is written into a teacher cache. Returned tensors are borrowed until
-the next call to the same graph; weights and the linear backend must stay fixed.
+the next call to the same graph; weights, linear backend and bridge callback must stay fixed.
 """
 import torch
 
@@ -14,6 +14,7 @@ class DraftGraph:
             raise ValueError('Unsupported graph geometry')
         self.model=model;self.block=block_size;self.capacity=teacher_capacity
         self.linear=model.linear
+        self.bridge=model.bridge
         device=model.device;h=model.h
         self.embeds=torch.zeros((block_size,h),device=device,dtype=torch.bfloat16)
         self.ids=torch.zeros(block_size,device=device,dtype=torch.int64)
@@ -36,7 +37,7 @@ class DraftGraph:
     def __call__(self,seq,embeds,ids,positions):
         model=self.model;entry=model.cache.get(seq)
         start=0 if entry is None else entry['next']
-        if (model.linear is not self.linear or embeds.shape!=(self.block,model.h)
+        if (model.linear is not self.linear or model.bridge is not self.bridge or embeds.shape!=(self.block,model.h)
                 or embeds.dtype!=torch.bfloat16 or ids.shape!=(self.block,)
                 or positions.shape!=(self.block,) or ids.dtype!=torch.int64 or positions.dtype!=torch.int64
                 or any(x.device!=model.device for x in (embeds,ids,positions))):

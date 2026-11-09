@@ -75,6 +75,7 @@ class TorchDspine:
         self.inv_freq = self.theta ** (-torch.arange(0,self.dim,2,device=self.device,dtype=torch.float32)/self.dim)
         self.cache = {}
         self.linear = torch.nn.functional.linear
+        self.bridge = Ref.bridge_layer
 
     @classmethod
     def from_checkpoint(cls, directory, device='cpu'):
@@ -178,7 +179,7 @@ class TorchDspine:
             mlp=self.linear(glu,self.w[prefix+'mlp.down_proj.weight'])
             read=self.w['selected_prefix_bridge.read_weight'] if layer==self.layers-1 else self.w['selected_prefix_bridge.early_read_weights'][layer]
             next_norm=self.w['norm.weight'] if layer==self.layers-1 else self.w[f'layers.{layer+1}.input_layernorm.weight']
-            hidden,residual,stash=Ref.bridge_layer(mlp,residual,input_ids,read,self.w['selected_prefix_bridge.codebook'],
+            hidden,residual,stash=self.bridge(mlp,residual,input_ids,read,self.w['selected_prefix_bridge.codebook'],
                 self.packed,self.w['selected_prefix_bridge.gate.bias'],self.w['selected_prefix_bridge.feature_write_weights'][layer],
                 next_norm,t,self.bridge_eps,self.eps)
         return hidden,stash

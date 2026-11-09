@@ -93,8 +93,11 @@ def quantize_channel_weight(weight):
 
 class NativeChannelLinear:
     """Compare the target head's W8A16 kernel with group-128 W8A8 drafting."""
-    def __init__(self,weights,prebuilt,device=0):
+    def __init__(self,weights,prebuilt,device=0,row_band=16):
+        if row_band not in [16,32]:
+            raise ValueError('Channel projection row band must be16 or32')
         self.device=device
+        self.row_band=row_band
         self.module=hip_module.HipModule(prebuilt,'dflash_bgemm',device)
         self.weights={}
         for name,weight in weights.items():
@@ -115,8 +118,9 @@ class NativeChannelLinear:
             raise ValueError('Expected nonempty [rows,K] BF16 on the module device')
         m=inputs.shape[0]
         output=torch.empty((m,n),device=inputs.device,dtype=torch.bfloat16)
-        # This symbol's body is the general 16-row slice: blockIdx.y selects
-        # its m0, and the store bounds every row. It also serves a partial tile.
-        self.module.launch('dflash_bgemm_w8_m16n16_w128_u16',((n+63)//64,(m+15)//16,1),(128,1,1),
+        # Both bands bound stores by the actual row count, including partial tiles.
+        band=self.row_band
+        name='dflash_bgemm_w8_m16n16_w128_u16' if band==16 else 'dflash_bgemm_w8_m32n16_w128_u16_nt'
+        self.module.launch(name,((n+63)//64,(m+band-1)//band,1),(128,1,1),
                            {'a':inputs.contiguous(),'w':q,'ws':scales,'c':output,'m':m,'n':n,'k':k})
         return output
