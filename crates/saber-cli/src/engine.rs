@@ -9805,8 +9805,16 @@ pub fn serve(args: &ServeArgs) -> anyhow::Result<()> {
     );
     if serve_width > 1 && serve_drafts {
         executor.set_drafter(Box::new(EngineDrafter::new(serve_width - 1)));
-        if args.engine.dspine_socket.is_some() {
+        if args.engine.dspine_socket.is_some()
+            || (matches!(
+                args.engine.spec_tree,
+                saber_engine::spec_tree::SpecTreeForm::Best16
+                    | saber_engine::spec_tree::SpecTreeForm::Ancestor9
+            ) && args.engine.draft_block == 16)
+        {
             executor.enable_scalar_context_tail();
+        }
+        if args.engine.dspine_socket.is_some() {
             println!("drafter        DSpine Unix socket, scheduled verify width {serve_width}");
         } else {
             println!("drafter        the engine's own DFlash2 proposal, block {serve_width}, one per live slot per decode step");

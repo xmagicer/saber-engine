@@ -67,12 +67,40 @@ fn state_advance_keeps_the_record_layout_of_both_tree_forms() {
                 update.arg(name).unwrap().value
             );
         }
-        if rows == 16 {
-            assert!(
-                saber::tree_gdn_advance_layers(&from_update, 48).is_err(),
-                "the 10-row batched object must never receive 16-row record offsets"
+        let batched = saber::tree_gdn_advance_layers(&from_update, 48).unwrap();
+        assert_eq!(batched.grid, [48, 24, 1]);
+        let expected = if rows == 16 {
+            (
+                "p27_tree_advl16",
+                "p27_gdn_tree_advance_layers_t16_f16s_k128_v128",
+            )
+        } else {
+            (
+                "p27_tree_advl",
+                "p27_gdn_tree_advance_layers_f16s_k128_v128",
+            )
+        };
+        assert_eq!((batched.plugin.as_str(), batched.kernel.as_str()), expected);
+        for name in ["st_slot", "st_head", "ts_seq", "ts_head"] {
+            assert_eq!(
+                batched.arg(name).unwrap().value,
+                from_update.arg(name).unwrap().value
             );
         }
+        let mut wrong_record = from_update.clone();
+        wrong_record
+            .args
+            .iter_mut()
+            .find(|s| s.name == "ts_head")
+            .unwrap()
+            .value = ArgValue::I64 {
+            ival: if rows == 16 {
+                10 * 256 + 32
+            } else {
+                16 * 256 + 32
+            },
+        };
+        assert!(saber::tree_gdn_advance_layers(&wrong_record, 48).is_err());
     }
     assert!(saber::tree_gdn_advance(shape(17)).is_err());
 }

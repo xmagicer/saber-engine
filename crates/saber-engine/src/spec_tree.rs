@@ -148,7 +148,11 @@ impl SpecTree {
     /// # Errors
     /// More candidates than the drafter's positions.
     pub fn chain(cands: &[u32]) -> Result<SpecTree, TreeError> {
-        SpecTree::new(
+        Self::chain_limited(cands, DRAFT_POSITIONS)
+    }
+
+    pub(crate) fn chain_limited(cands: &[u32], max_depth: u32) -> Result<SpecTree, TreeError> {
+        Self::new_limited(
             cands
                 .iter()
                 .enumerate()
@@ -158,6 +162,7 @@ impl SpecTree {
                     parent: i.checked_sub(1),
                 })
                 .collect(),
+            max_depth,
         )
     }
 
@@ -400,7 +405,7 @@ pub struct LatticeView<'a> {
     pub cand: &'a [i64],
     /// Edge scores.
     pub scores: &'a [f32],
-    /// Drafted positions (7).
+    /// Drafted positions in this request (block size minus the anchor).
     pub steps: usize,
     /// Candidates a position (16).
     pub k: usize,
@@ -565,7 +570,10 @@ pub fn best_first(
             }
         }
     }
-    SpecTree::new(nodes)
+    // The proposal's actual score table bounds depth. A trained block-8 pack
+    // can also serve a 16-row query; in that case 15 positions were evaluated.
+    let max_depth = lat.steps.min((TREE_MAX_ROWS - 1) as usize) as u32;
+    SpecTree::new_limited(nodes, max_depth)
 }
 
 /// Where one conv window element comes from: a verify row's input, or the committed tail's

@@ -4449,6 +4449,15 @@ fn run(
 ) -> Result<(), ForwardError> {
     use crate::startup::Phase as Boot;
     let dspine = cfg.dspine_socket.is_some();
+    if cfg.draft_block == 16
+        && cfg.spec_tree == crate::spec_tree::SpecTreeForm::Ancestor9
+        && (cfg.max_seqs != 1
+            || cfg.decode_batches != [1]
+            || cfg.decode_widths != [1, 10]
+            || cfg.gdn_replay)
+    {
+        return Err(ForwardError::Device("native block16 ancestor9 requires one sequence, batches 1, widths 1,10 and --engine-gdn-replay off".into()));
+    }
     if dspine
         && (cfg.max_seqs != 1
             || cfg.decode_batches != [1]
@@ -8344,9 +8353,8 @@ fn run(
             .map_err(device_err("the tree flush's table"))?;
         // CMP27L (`--engine-b1-arms adv|all`): the per-layer advances as ONE launch over
         // `[layers]` tables of the same state / record bases, at the same strides.
-        // The batched object is compiled for the 10-row record. The 16-row form uses its
-        // existing per-layer advance; reusing the 10-row offsets would corrupt state.
-        let advance_layers = if cfg.b1_arms.adv_batch && tree_rows == 10 {
+        // Resolve the batched kernel from the exact record layout of its per-layer donor.
+        let advance_layers = if cfg.b1_arms.adv_batch && matches!(tree_rows, 10 | 16) {
             let d0 = advance.first().map(|a| a.0.clone()).ok_or_else(|| {
                 ForwardError::Device("--engine-b1-arms adv: no tree advance".to_owned())
             })?;
@@ -8387,9 +8395,6 @@ fn run(
             );
             Some((d, states, records))
         } else {
-            if cfg.b1_arms.adv_batch && tree_rows == 16 {
-                println!("b1arms rank {}: best16 uses the 16-row per-layer state advance; the batched object is 10-row only", cfg.rank);
-            }
             None
         };
         println!(
@@ -13156,7 +13161,7 @@ struct ConvCommit {
 }
 
 type TreeTables = BTreeMap<i32, (Vec<u16>, Vec<i64>)>;
-type TreePlans = Vec<Option<(Vec<TokenId>, crate::spec_tree::TreePlan)>>;
+type TreePlans = Vec<Option<crate::spec_tree_step::NativeTreeOffer>>;
 type TreeSeqs = BTreeMap<
     SeqId,
     (
@@ -15225,6 +15230,7 @@ fn propose_after_prefill(
         res,
         tap,
         &frame,
+        Some((seq, done_before + committed, fed)),
         link.as_deref_mut(),
         vocab,
         counts,
@@ -15255,6 +15261,7 @@ fn propose_block(
     res: &DraftResident,
     tap: &AuxTap,
     frame: &[u8],
+    owner: Option<(SeqId, u32, TokenId)>,
     mut link: Option<&mut RankLink>,
     vocab: u32,
     counts: &DraftCounters,
@@ -15937,7 +15944,11 @@ fn propose_block(
                 if let (Some(t), Some(Ok(p))) = (&res.tree, plan.as_ref()) {
                     t.plans
                         .borrow_mut()
-                        .push(Some((block_ids.clone(), p.clone())));
+                        .push(Some(crate::spec_tree_step::NativeTreeOffer {
+                            owner,
+                            chain: block_ids.clone(),
+                            plan: p.clone(),
+                        }));
                 } else if let Some(t) = &res.tree {
                     t.plans.borrow_mut().push(None);
                 }
@@ -21094,6 +21105,18 @@ fn decode_step(
             }
             selected.map(|p| (p, true))
         }
+        Some(t)
+            if slots.len() == 1
+                && drafter.is_some_and(|(res, _)| res.cfg.block_size == 16)
+                && (width != t.rows as u32
+                    || geom.max_ctx.saturating_sub(slots[0].context_len) < t.rows as u32) =>
+        {
+            // The scheduler selected a narrow step (e.g. at the context limit).
+            // Do not promote it back to a full tree with out-of-range KV slots.
+            t.plans.borrow_mut().clear();
+            t.last_path.borrow_mut().clear();
+            None
+        }
         Some(t) if image_seq && band.is_none() && batch == 1 => {
             // Drained so the queued lattice plan does not meet the next step.
             t.plans.borrow_mut().drain(..).next();
@@ -21104,20 +21127,32 @@ fn decode_step(
             let lattice = t.plans.borrow_mut().drain(..).next().flatten();
             let lattice = lattice
                 // P27-W2-3: a SAMPLED slot takes its lattice plan too under the drawn law.
-                .filter(|(block, _)| (s.decider.is_none() || t.drawn) && *block == s.draft)
-                .map(|(_, p)| p.with_anchor(i64::from(s.input)));
+                .filter(|_| s.decider.is_none() || t.drawn)
+                .and_then(|offer| {
+                    offer.for_step(
+                        s.seq,
+                        s.context_len,
+                        s.input,
+                        &s.draft,
+                        drafter.is_some_and(|(res, _)| res.cfg.block_size == 16),
+                    )
+                });
             match lattice {
                 Some(p) => Some((p, true)),
                 None => {
                     let rid = s.row_ids();
-                    let p = crate::spec_tree_step::draft_chain_plan(rid[0], &rid[1..]).map_err(
-                        |e| {
-                            ForwardError::Device(format!(
-                                "{}: the tree form's chain plan: {e}",
-                                s.seq
-                            ))
-                        },
-                    )?;
+                    let positions = drafter
+                        .map_or(crate::spec_tree::DRAFT_POSITIONS, |(res, _)| {
+                            res.cfg.selector_positions()
+                        });
+                    let p = crate::spec_tree_step::draft_chain_plan_limited(
+                        rid[0],
+                        &rid[1..],
+                        positions.min(t.rows as u32 - 1),
+                    )
+                    .map_err(|e| {
+                        ForwardError::Device(format!("{}: the tree form's chain plan: {e}", s.seq))
+                    })?;
                     Some((p, false))
                 }
             }
@@ -22752,6 +22787,10 @@ fn step_proposal(
                     res,
                     t,
                     &frame,
+                    match proposals {
+                        [(seq, done, committed, anchor)] => Some((*seq, done + committed, *anchor)),
+                        _ => None,
+                    },
                     link.as_deref_mut(),
                     // The WHOLE vocabulary: at two ranks the walk's ids are global.
                     vocab_total,
@@ -22824,6 +22863,11 @@ fn step_proposal(
                                     res,
                                     t,
                                     &rframe,
+                                    Some((
+                                        proposals[i].0,
+                                        proposals[i].1 + proposals[i].2,
+                                        proposals[i].3,
+                                    )),
                                     link.as_deref_mut(),
                                     vocab_total,
                                     draft_counts,
@@ -23788,6 +23832,7 @@ fn follow_proposals(
             res,
             tap,
             &frame,
+            None,
             Some(link),
             vocab,
             draft_counts,

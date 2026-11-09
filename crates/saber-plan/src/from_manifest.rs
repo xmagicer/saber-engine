@@ -574,6 +574,10 @@ pub const SEPARATELY_PLANNED: &[(&str, &str)] = &[
          swapped in by the `--engine-b1-arms conv` arm, never a row of the chain plan",
     ),
     (
+        "p27_tree_advl16",
+        "The 16-row tree flush batches the GDN state advances across layers.",
+    ),
+    (
         "p27_tree_advl",
         "CMP27L: the R2 flush's GDN advances for every layer in ONE launch (bit-exact vs \
          `p27_tree_gdn`'s advance) -- named by the `--engine-b1-arms adv` arm, never a row of \

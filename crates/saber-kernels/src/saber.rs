@@ -3343,7 +3343,7 @@ pub fn tree_conv_commit(
 }
 
 /// **CMP27L ARM: the flush's advance for every GDN layer in ONE launch**
-/// (`p27_gdn_tree_advance_layers_f16s_k128_v128`, `p27_tree_advl.hsaco`): grid (`layers`, heads,
+/// The batched kernel uses the same record layout as its single-layer donor. Grid (`layers`, heads,
 /// 1), `state_base` / `ts_base` = [layers] u64 tables of each layer's state pool and record, the
 /// strides of the per-layer advance `one` ([`tree_gdn_advance_like`]'s; every layer's must agree,
 /// the caller checks); the per-layer launch's bytes.
@@ -3351,18 +3351,36 @@ pub fn tree_conv_commit(
 /// # Errors
 /// `one` is not the per-layer advance, or carries no stride.
 pub fn tree_gdn_advance_layers(one: &LaunchDescriptor, layers: u32) -> Result<LaunchDescriptor> {
-    if one.kernel != "p27_gdn_tree_advance_f16s_k128_v128" {
-        return Err(Error::Rule(format!(
-            "gdn_tree_advance_layers: built from the per-layer advance, not `{}`",
-            one.kernel
-        )));
-    }
+    let (plugin, kernel, rows) = match (one.plugin.as_str(), one.kernel.as_str()) {
+        ("p27_tree_gdn", "p27_gdn_tree_advance_f16s_k128_v128") => (
+            "p27_tree_advl",
+            "p27_gdn_tree_advance_layers_f16s_k128_v128",
+            TREE_ROWS,
+        ),
+        ("p27_tree_gdn16", "p27_gdn_tree16_advance_f16s_k128_v128") => (
+            "p27_tree_advl16",
+            "p27_gdn_tree_advance_layers_t16_f16s_k128_v128",
+            TREE16_ROWS,
+        ),
+        _ => {
+            return Err(Error::Rule(format!(
+                "gdn_tree_advance_layers: unsupported single-layer kernel `{}:{}`",
+                one.plugin, one.kernel
+            )))
+        }
+    };
     let imm = |name: &str| -> Result<i64> {
         match one.arg(name).map(|s| &s.value) {
             Some(ArgValue::I64 { ival } | ArgValue::I32 { ival }) => Ok(*ival),
             _ => Err(Error::Rule(format!("gdn_tree_advance_layers: no `{name}`"))),
         }
     };
+    if imm("ts_head")? != i64::from(tree_rec_floats(rows)) {
+        return Err(Error::Rule(format!(
+            "gdn_tree_advance_layers: {}-row record stride does not match its kernel",
+            rows
+        )));
+    }
     let (args, bytes) = KArgs::new(abi::SIG_P27_GDN_TREE_ADVANCE_LAYERS)
         .buf("state_base")
         .buf("ts_base")
@@ -3376,8 +3394,8 @@ pub fn tree_gdn_advance_layers(one: &LaunchDescriptor, layers: u32) -> Result<La
         .finish()?;
     Ok(LaunchDescriptor {
         op: "gdn_tree_advance_layers".into(),
-        plugin: "p27_tree_advl".into(),
-        kernel: "p27_gdn_tree_advance_layers_f16s_k128_v128".into(),
+        plugin: plugin.into(),
+        kernel: kernel.into(),
         grid: [layers, one.grid[1], 1],
         block: [256, 1, 1],
         shared_bytes: 0,

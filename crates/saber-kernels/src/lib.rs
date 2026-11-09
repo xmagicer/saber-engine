@@ -236,9 +236,8 @@ pub fn rule_table_for_plugin(plugin: &str) -> Option<&'static str> {
         // P27-15: the 27B's ancestor-mask tree verify (the WY GDN tree update + advance, the
         // ancestor-word decode attention). No policy row binds them: the tree arm names them.
         "p27_tree_gdn" | "p27_tree_attn" | "p27_tree_conv" | "p27_tree_kv" | "p27_tree_flush"
-        | "p27_tree_gdn16" | "p27_tree_attn16" | "p27_tree_rows" | "p27_tree_advl" => {
-            "noop_gfx1201.toml"
-        }
+        | "p27_tree_gdn16" | "p27_tree_attn16" | "p27_tree_rows" | "p27_tree_advl"
+        | "p27_tree_advl16" => "noop_gfx1201.toml",
         // P27-W2-5: the GDN decode update as base + stash + replay. No policy row binds it: the
         // `--engine-gdn-replay` arm names it.
         "p27w2_gdn_replay" => "noop_gfx1201.toml",
@@ -751,6 +750,10 @@ pub mod prebuilt {
         (
             "p27_tree_advl.hsaco",
             "p27_gdn_tree_advance_layers_f16s_k128_v128",
+        ),
+        (
+            "p27_tree_advl16.hsaco",
+            "p27_gdn_tree_advance_layers_t16_f16s_k128_v128",
         ),
         // E4-3 (the 16-row tree form): the 16-row tree objects -- the WY GDN tree at TG_TM 16 and
         // the anc decode body at 6 warps (96 rows = 16 x GQA 6). Their own objects: the 10-row
