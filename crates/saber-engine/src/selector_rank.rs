@@ -37,6 +37,8 @@ pub enum SelectorRank {
     Walk,
     /// The host's expected-length chain over the same lattice (`explen`, an ARM).
     ExpLen,
+    /// Calibrated conditional edges for the native Tandem B16 nine-node verifier.
+    TandemB16Calibrated,
 }
 
 impl SelectorRank {
@@ -46,6 +48,7 @@ impl SelectorRank {
         match self {
             Self::Walk => "walk",
             Self::ExpLen => "explen",
+            Self::TandemB16Calibrated => "tandem-b16-calibrated",
         }
     }
 
@@ -57,14 +60,15 @@ impl SelectorRank {
         match s {
             "walk" => Ok(Self::Walk),
             "explen" => Ok(Self::ExpLen),
+            "tandem-b16-calibrated" => Ok(Self::TandemB16Calibrated),
             o => Err(format!(
                 "--engine-selector-rank `{o}`: the forms are `walk` (the device's greedy walk, \
-                 the default) and `explen` (the expected-length chain, P27-12)"
+                 the default), `explen` (expected-length chain), and `tandem-b16-calibrated` (calibrated tree)"
             )),
         }
     }
 
-    /// True when the host re-ranks (the proposal reads the lattice back).
+    /// True for expected-length *chain* reranking. Tree ranking uses the separate tree-plan read.
     #[must_use]
     pub const fn reranks(self) -> bool {
         matches!(self, Self::ExpLen)
@@ -190,7 +194,8 @@ mod tests {
         assert!(SelectorRank::parse("viterbi").is_err());
         assert!(!SelectorRank::Walk.reranks());
         assert!(SelectorRank::ExpLen.reranks());
-        for f in [SelectorRank::Walk, SelectorRank::ExpLen] {
+        assert!(!SelectorRank::TandemB16Calibrated.reranks());
+        for f in [SelectorRank::Walk, SelectorRank::ExpLen, SelectorRank::TandemB16Calibrated] {
             assert_eq!(SelectorRank::parse(f.as_str()), Ok(f));
         }
     }

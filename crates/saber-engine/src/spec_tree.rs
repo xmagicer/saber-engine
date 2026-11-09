@@ -43,6 +43,8 @@
 //! 8 x 8 + 1 = 65 slot sets today). Conv: `state_len = conv_width - 1 + q - 1` with `q` the
 //! pseudo-sequence's rows ([`conv_state_len`], `docs/EXEC.md` "the conv cache's stride").
 
+pub(crate) mod tandem_b16;
+
 use std::fmt;
 
 /// Query rows a sequence holds in the SABER decode attention tile (64 rows / GQA 6, floor).

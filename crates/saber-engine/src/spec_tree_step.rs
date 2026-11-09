@@ -528,6 +528,13 @@ pub fn plans_from_read(
     steps: usize,
     k: usize,
 ) -> Vec<Result<TreePlan, TreeError>> {
+    plans_from_read_for_selector(form, crate::selector_rank::SelectorRank::Walk, anchors, scores, cand, steps, k)
+}
+
+pub(crate) fn plans_from_read_for_selector(
+    form: SpecTreeForm, selector: crate::selector_rank::SelectorRank, anchors: &[i64],
+    scores: &[u8], cand: &[u8], steps: usize, k: usize,
+) -> Vec<Result<TreePlan, TreeError>> {
     let (ls, lc) = (steps * k * k * 4, steps * k * 8);
     anchors
         .iter()
@@ -551,16 +558,12 @@ pub fn plans_from_read(
                 .chunks_exact(8)
                 .map(|b| i64::from_le_bytes(b.try_into().unwrap_or_default()))
                 .collect();
-            TreePlan::from_lattice(
-                form,
-                anchor,
-                &LatticeView {
-                    cand: &c,
-                    scores: &s,
-                    steps,
-                    k,
-                },
-            )
+            let lat = LatticeView { cand: &c, scores: &s, steps, k };
+            if selector == crate::selector_rank::SelectorRank::TandemB16Calibrated {
+                crate::spec_tree::tandem_b16::plan(form, anchor, &lat)
+            } else {
+                TreePlan::from_lattice(form, anchor, &lat)
+            }
         })
         .collect()
 }

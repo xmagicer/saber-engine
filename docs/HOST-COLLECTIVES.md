@@ -137,3 +137,13 @@ returns chain or 15-node proposals. In the tested matched-Quark configuration
 the optimized tree measured 203.91 tok/s for code and 137.57 tok/s for prose.
 The standard NVFP4 + DFlash2 hybrid remains the deployed configuration.
 [See the DSpine launch procedure and feature limits](../tools/dspine/README.md).
+
+## Tandem B16 candidate calibration
+
+With the matched Quark Qwen3.8-27B core and a resident Tandem B16 drafter,
+`--engine-selector-rank tandem-b16-calibrated` scores all 16 conditional
+candidates before selecting three children per parent for the nine-node tree.
+Use TP=2, one sequence, decode batches `1`, widths `1,10`, draft block 16,
+`--engine-spec-tree ancestor9` and `--engine-gdn-replay off`.
+Both ranks check the packed target and draft identities on startup.
+The default selector is `walk`. The target verifies every proposed path.

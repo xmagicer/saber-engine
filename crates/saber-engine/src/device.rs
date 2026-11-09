@@ -4451,6 +4451,23 @@ fn run(
 ) -> Result<(), ForwardError> {
     use crate::startup::Phase as Boot;
     let dspine = cfg.dspine_socket.is_some();
+    if cfg.selector_rank == crate::selector_rank::SelectorRank::TandemB16Calibrated {
+        if dspine || cfg.world != 2 || cfg.draft_block != 16 || cfg.max_seqs != 1
+            || cfg.decode_batches != [1] || cfg.decode_widths != [1, 10] || cfg.gdn_replay
+            || spec_tree_arm(cfg).runs != crate::spec_tree::SpecTreeForm::Ancestor9 {
+            return Err(ForwardError::Device("tandem-b16-calibrated requires native TP2, B16, ancestor9, max-seqs 1, batches 1, widths 1,10 and GDN replay off".into()));
+        }
+        let draft = cfg.draft_pack.as_ref().ok_or_else(|| ForwardError::Device(
+            "tandem-b16-calibrated requires a resident drafter".into()))?;
+        let tier = |dir: &std::path::Path| {
+            PackReader::open(&pack_file(dir, cfg.rank))
+                .map(|r| r.header().tier_id)
+                .map_err(device_err("opening calibrated target and draft pack headers"))
+        };
+        if !crate::spec_tree::tandem_b16::supports_packs(&tier(&cfg.pack)?, &tier(draft)?) {
+            return Err(ForwardError::Device("tandem-b16-calibrated requires the matching Quark 27B target and Tandem B16 draft pack tier IDs".into()));
+        }
+    }
     if cfg.draft_block == 16
         && cfg.spec_tree == crate::spec_tree::SpecTreeForm::Ancestor9
         && (cfg.max_seqs != 1
@@ -15934,8 +15951,9 @@ fn propose_block(
         if res.spec_tree_plans {
             if let Some((sc, ca)) = lattice.as_ref() {
                 let plan = sc.get(r * lat_s..).zip(ca.get(r * lat_c..)).map(|(s, c)| {
-                    crate::spec_tree_step::plans_from_read(
+                    crate::spec_tree_step::plans_from_read_for_selector(
                         res.spec_tree_form,
+                        res.selector_rank,
                         &[0],
                         s,
                         c,
@@ -15944,6 +15962,13 @@ fn propose_block(
                     )
                     .remove(0)
                 });
+                if res.selector_rank == crate::selector_rank::SelectorRank::TandemB16Calibrated {
+                    match plan.as_ref() {
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => return Err(ForwardError::Device(format!("tandem-b16-calibrated tree: {e}"))),
+                        None => return Err(ForwardError::Device("tandem-b16-calibrated tree has no selector frame".into())),
+                    }
+                }
                 if let (Some(t), Some(Ok(p))) = (&res.tree, plan.as_ref()) {
                     t.plans
                         .borrow_mut()
