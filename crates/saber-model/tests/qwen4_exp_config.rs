@@ -35,6 +35,7 @@ fn doctor(f: impl FnOnce(&mut Value)) -> String {
 
 #[test]
 fn fixture_is_the_checkpoints_config() {
+    use sha2::{Digest, Sha256};
     for (fixture, dir) in [
         (QUARK, "/mnt/nvme/models/Qwen3.8-Flash-Next-Quark-MXFP4"),
         (NVFP4, "/mnt/nvme/models/Qwen3.8-Flash-Next-NVFP4"),
@@ -45,12 +46,15 @@ fn fixture_is_the_checkpoints_config() {
             eprintln!("SKIP: {} absent; the fixture stands alone", p.display());
             continue;
         }
-        assert_eq!(
-            std::fs::read_to_string(&p).unwrap(),
-            fixture,
-            "{}",
-            p.display()
-        );
+        let actual = std::fs::read_to_string(&p).unwrap();
+        if fixture == QUARK
+            && hex::encode(Sha256::digest(actual.as_bytes()))
+                == "575c1cfc93affb7d77ff56208b68320672bf7d39b2fd35a60e0084cae701336c"
+        {
+            parse(&actual); // AMD's alternate, pinned Quark 0.14 export.
+        } else {
+            assert_eq!(actual, fixture, "{}", p.display());
+        }
     }
 }
 
@@ -313,6 +317,44 @@ fn refuses_a_quark_exclude_that_does_not_match_the_model() {
         e.contains("layers.7.self_attn.o_proj") && e.contains("not excluded"),
         "{e}"
     );
+}
+
+#[test]
+fn quark_014_optional_annotations_preserve_mxfp4_geometry() {
+    let mut v: Value = serde_json::from_str(QUARK).unwrap();
+    let q = &mut v["quantization_config"];
+    for side in ["weight", "input_tensors"] {
+        q["global_quant_config"][side]["zero_point_type"] = Value::from("int32");
+    }
+    q["exclude"].as_array_mut().unwrap().extend([
+        Value::from("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_127"),
+        Value::from("model.visual.pos_embed"),
+        Value::from("model.visual.patch_embed.proj"),
+    ]);
+    let cfg = parse(&v.to_string());
+    assert_eq!(cfg.layers, parse(QUARK).layers);
+    for side in ["weight", "input_tensors"] {
+        let mut bad = v.clone();
+        bad["quantization_config"]["global_quant_config"][side]["zero_point_type"] =
+            Value::from("uint8");
+        let error = refused(&bad);
+        assert!(
+            error.contains(&format!("global_quant_config.{side}.zero_point_type")),
+            "{error}"
+        );
+    }
+    for path in [
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_128",
+        "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.shard_0",
+        "model.visual.patch_embed.unknown",
+    ] {
+        let mut bad = v.clone();
+        bad["quantization_config"]["exclude"]
+            .as_array_mut()
+            .unwrap()
+            .push(Value::from(path));
+        assert!(refused(&bad).contains(path));
+    }
 }
 
 /// FN144: the FP4-Local config -- the same text / vision facts as Quark; 545 modules: 48 CSF

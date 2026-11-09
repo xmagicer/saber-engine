@@ -185,7 +185,8 @@ if [ -f "$REPO/tools/capture/p2p_mounts.sh" ]; then
 fi
 # GPU_MAX_HW_QUEUES=3: the user's rule 10-26 (other devs report a slowdown at 4 or more); the env var overrides for a probe
 $CTR rm -f "$CNAME" >/dev/null 2>&1 || true
-$CTR run -d --name "$CNAME" --security-opt label=disable --security-opt seccomp=unconfined \
+# The PLE readers on each rank keep multiple checkpoint shards open concurrently.
+$CTR run -d --name "$CNAME" --ulimit nofile=65536:65536 --security-opt label=disable --security-opt seccomp=unconfined \
   "${CTR_GPU[@]}" "${CTR_USER[@]}" --ipc=host --network=host \
   -e HIP_VISIBLE_DEVICES="${HIP_DEVICES:-0,1}" -e GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-3}" -e LD_LIBRARY_PATH=/opt/rocm/lib -e PYTHONDONTWRITEBYTECODE=1 "${P2P[@]}" \
   -v "$SHARED":"$SHARED" -v "$NVME"/models:"$NVME"/models:ro -v "$NVME"/saber-packs:"$NVME"/saber-packs:ro \

@@ -1028,11 +1028,22 @@ impl Qwen4ExpConfig {
                     .ok_or_else(|| err(format!("quantization_config.exclude: non-string {x}")))
             })
             .collect::<Result<_, _>>()?;
-        let known = self.linear_modules();
+        let mut known: std::collections::HashSet<_> = self.linear_modules().into_iter().collect();
+        // Quark 0.14 also lists unquantized embedding and patch-projection modules.
+        // A PLE shard must belong to a configured PLE layer and be within its table.
+        for layer in self.ple.layer_indices() {
+            for shard in 0..self.ple.split_parts {
+                known.insert(format!(
+                    "model.language_model.layers.{layer}.ple.ple_embedding.ngram_embedding.shard_{shard}"
+                ));
+            }
+        }
+        known.insert("model.visual.pos_embed".into());
+        known.insert("model.visual.patch_embed.proj".into());
         for e in &exclude {
-            if !known.iter().any(|k| k == e) {
+            if !known.contains(e) {
                 return Err(err(format!(
-                    "quantization_config.exclude: `{e}` is not a linear module of this model"
+                    "quantization_config.exclude: `{e}` is not a linear module or a recognized embedding/patch module of this model"
                 )));
             }
         }
@@ -1214,6 +1225,11 @@ fn mx_spec(mut s: Fields<'_>, dynamic: bool) -> Result<MxSpec, ModelError> {
     s.expect("symmetric", &Value::Null)?;
     s.expect("round_method", &Value::from("half_even"))?;
     s.expect("scale_type", &Value::from("float"))?;
+    // Quark 0.14 serializes the zero-point storage type even for this MX format,
+    // which has no additive zero point. Older exports omit the annotation.
+    if s.optional("zero_point_type").is_some() {
+        s.expect("zero_point_type", &Value::from("int32"))?;
+    }
     s.expect("scale_format", &Value::from("e8m0"))?;
     s.expect("scale_calculation_mode", &Value::from("even"))?;
     s.expect("mx_element_dtype", &Value::Null)?;
