@@ -223,6 +223,8 @@ pub struct EngineArgs {
     /// P27-12: `--selector-rank walk|explen` -- how a proposal ranks the selector's lattice.
     /// FORWARDED to rank 1 by value: the two ranks compare one block digest.
     pub selector_rank: saber_engine::selector_rank::SelectorRank,
+    /// Score the full FP8 vocabulary for a single B8 proposal.
+    pub draft_full_vocab: bool,
     /// P27-15c: `--spec-tree off|ancestor9` -- the verify's row form (the tree is an ARM; a form
     /// the boot cannot run is refused by name and runs `off`). FORWARDED to rank 1 by value.
     pub spec_tree: saber_engine::spec_tree::SpecTreeForm,
@@ -443,6 +445,7 @@ impl EngineArgs {
             draft_kv_paged: self.draft_kv_paged,
             draft_embed_share: self.draft_embed_share,
             selector_rank: self.selector_rank,
+            draft_full_vocab: self.draft_full_vocab,
             spec_tree: self.spec_tree,
             spec_tree_sampled: self.spec_tree_sampled,
             spec_tree_sampled_control: self.spec_tree_sampled_control,
@@ -10417,6 +10420,9 @@ impl Worker {
         // AND THE SELECTOR'S RANK FORM (P27-12), BY VALUE: both ranks re-rank or neither, or the
         // block digests they compare differ.
         cmd.arg("--selector-rank").arg(args.selector_rank.as_str());
+        if args.draft_full_vocab {
+            cmd.arg("--draft-full-vocab");
+        }
         // AND THE TREE ARM (P27-15c), BY VALUE: both ranks resolve one form, read one lattice.
         cmd.arg("--spec-tree").arg(args.spec_tree.as_str());
         // AND THE SAMPLED TREE LAW (P27-W2-3), BY VALUE: the follower takes the drawn path.
@@ -11412,6 +11418,7 @@ mod ar_band_tests {
             draft_kv_paged: false,
             draft_embed_share: false,
             selector_rank: saber_engine::selector_rank::SelectorRank::Walk,
+            draft_full_vocab: false,
             spec_tree: saber_engine::spec_tree::SpecTreeForm::Off,
             spec_tree_sampled: false,
             spec_tree_sampled_control: false,

@@ -135,7 +135,7 @@ both TP ranks. Worker wire version 17 requires matched binaries.
 The experimental DSpine socket backend consumes verified target features and
 returns chain or 15-node proposals. In the tested matched-Quark configuration
 the optimized tree measured 203.91 tok/s for code and 137.57 tok/s for prose.
-The standard NVFP4 + DFlash2 hybrid remains the deployed configuration.
+At the time of the DSpine experiment the managed service ran the NVFP4 + DFlash2 hybrid. The current eight-slot profile uses the matched Quark target and Tandem B8 with a full FP8 draft head for single-request proposals. [Managed profile and measurements](HOST-COLLECTIVES.zh-CN.md).
 [See the DSpine launch procedure and feature limits](../tools/dspine/README.md).
 
 ## Tandem B16 candidate calibration

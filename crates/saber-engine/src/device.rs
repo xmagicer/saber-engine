@@ -838,6 +838,8 @@ pub struct EngineConfig {
     /// the control); `ExpLen` = the host's expected-length chain over the same lattice (an ARM),
     /// read back in the proposal's own pinned batch. BOTH ranks: the two compare one block digest.
     pub selector_rank: crate::selector_rank::SelectorRank,
+    /// Score all rows of the resident FP8 head for single-request B8 proposals.
+    pub draft_full_vocab: bool,
     /// **P27-15c: the verify's row form** (`--engine-spec-tree`; [`crate::spec_tree::SpecTreeForm`]):
     /// `Off` = today's chain of 7 (the default and the control); `Ancestor9` = the best-first
     /// 9-node ancestor-mask tree (an ARM; numerics). The boot resolves it through
@@ -4451,6 +4453,13 @@ fn run(
 ) -> Result<(), ForwardError> {
     use crate::startup::Phase as Boot;
     let dspine = cfg.dspine_socket.is_some();
+    if cfg.draft_full_vocab
+        && (dspine || cfg.world != 2 || cfg.draft_block != 8 || cfg.draft_pack.is_none())
+    {
+        return Err(ForwardError::Device(
+            "full-vocabulary drafting requires a resident TP2 B8 drafter".into(),
+        ));
+    }
     if cfg.selector_rank == crate::selector_rank::SelectorRank::TandemB16Calibrated {
         if dspine || cfg.world != 2 || cfg.draft_block != 16 || cfg.max_seqs != 1
             || cfg.decode_batches != [1] || cfg.decode_widths != [1, 10] || cfg.gdn_replay
@@ -5193,6 +5202,11 @@ fn run(
             ),
             None => cfg.head.rerank().unwrap_or_default(),
         };
+        if cfg.draft_full_vocab && rerank != saber_model::dflash_graph::RerankHead::W8 {
+            return Err(ForwardError::Device(
+                "full-vocabulary drafting requires channel-FP8 rerank weights".into(),
+            ));
+        }
         let tier = crate::draft_tier::DraftTier::plan_with(
             cfg.world,
             cfg.draft_block,
@@ -13817,6 +13831,10 @@ fn build_drafter(
     };
     let mut drules = saber_kernels::dflash::DflashRules::prod_dflash()
         .map_err(device_err("the committed dflash rules"))?;
+    drules.head.full_vocab_b1 = cfg.draft_full_vocab;
+    if cfg.draft_full_vocab {
+        println!("draft head rank {}: full FP8 vocabulary at b1, INT2 preselection above b1", cfg.rank);
+    }
     if cfg.drafter_gateup_m64 > 0 {
         // CMP27K: the drafter gate_up's one-pass 64-row tile, bound for every drafter plan.
         drules.knobs.gateup_m64 = cfg.drafter_gateup_m64;

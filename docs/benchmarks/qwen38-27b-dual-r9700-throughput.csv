@@ -47,6 +47,20 @@ DSpine final-source A/B,two GPU shards,code,3,206.98,208.39,226.94,,,226.94,208.
 DSpine final-source A/B,two GPU shards,prose,3,138.0,140.0,141.54,,,132.47,140.0,141.54
 DSpine final-source A/B,after,code,3,207.51,202.32,223.73,,,223.73,202.32,196.47
 DSpine final-source A/B,after,prose,3,135.69,136.11,142.06,,,128.88,136.11,142.06
+B8 full-vocabulary draft A/B,all-vocab,code,3,232.86,233.45,236.59,322,336,236.59,233.45,228.53
+B8 full-vocabulary draft A/B,all-vocab,prose,3,166.83,165.58,170.91,202.33,214,163.98,170.91,165.58
+B8 full-vocabulary draft A/B,stock-a,code,3,224.61,224.77,230.07,309.33,322,230.07,224.77,219.0
+B8 full-vocabulary draft A/B,stock-a,prose,3,163.74,163.31,165.86,201.33,211,165.86,163.31,162.05
+B8 full-vocabulary draft A/B,stock-b,code,3,225.92,224.98,232.09,311.67,325,232.09,224.98,220.7
+B8 full-vocabulary draft A/B,stock-b,prose,3,164.55,164.01,167.37,201.67,211,167.37,164.01,162.25
+B8 restricted draft vocabulary A/B,full-w8,code,3,233.07,234.92,235.16,320,336,235.16,234.92,229.14
+B8 restricted draft vocabulary A/B,full-w8,prose,3,166.73,166.26,170.04,199.67,211,163.9,170.04,166.26
+B8 restricted draft vocabulary A/B,hot-32k,code,3,223.52,223.65,228.97,292.33,305,223.65,217.96,228.97
+B8 restricted draft vocabulary A/B,hot-32k,prose,3,168.78,167.38,182.25,213.67,254,156.71,182.25,167.38
+B8 restricted draft vocabulary A/B,stock-a,code,3,226.73,226.19,231.93,311.67,325,231.93,226.19,222.07
+B8 restricted draft vocabulary A/B,stock-a,prose,3,164.25,163.39,166.98,201.67,211,166.98,163.39,162.36
+B8 restricted draft vocabulary A/B,stock-b,code,3,223.88,223.24,230.46,309.33,322,230.46,223.24,217.94
+B8 restricted draft vocabulary A/B,stock-b,prose,3,163.76,163.26,165.2,201.67,211,165.2,163.26,162.83
 DSpine CPU parallel online,buffered-a,code,3,213.32,210.74,229.3,308.67,320,229.3,210.74,199.93
 DSpine CPU parallel online,buffered-a,prose,3,139.06,140.78,144.08,169.67,180,132.33,140.78,144.08
 DSpine CPU parallel online,buffered-b,code,3,210.91,206.81,229.43,304,320,229.43,206.81,196.48
@@ -57,6 +71,14 @@ DSpine CPU parallel online,stock-a,code,3,211.51,209.59,228.65,304,320,228.65,20
 DSpine CPU parallel online,stock-a,prose,3,137.53,139.36,143.12,165,177,130.1,139.36,143.12
 DSpine CPU parallel online,stock-b,code,3,213.45,212.63,226.27,309,331,226.27,212.63,201.46
 DSpine CPU parallel online,stock-b,prose,3,138.17,139.72,143.35,166.67,180,131.42,139.72,143.35
+Managed Quark B8 full vocabulary,INT2 before,code,3,222.59,220.6,227.25,304.67,316,227.25,220.6,219.91
+Managed Quark B8 full vocabulary,INT2 before,prose,3,162.23,162.46,163.34,200,208,163.34,162.46,160.9
+Managed Quark B8 full vocabulary,full FP8 head,code,3,234.22,235.6,236.9,318,336,235.6,236.9,230.15
+Managed Quark B8 full vocabulary,full FP8 head,prose,3,167.17,166.45,170.11,201.33,211,164.96,170.11,166.45
+Managed switch to Quark/Tandem B8,Quark/Tandem B8,code,3,224.23,223.54,229.47,306.67,322,229.47,223.54,219.68
+Managed switch to Quark/Tandem B8,Quark/Tandem B8,prose,3,164.34,163.99,166.02,201.67,211,166.02,163.99,163.01
+Managed switch to Quark/Tandem B8,earlier profile,code,3,201.84,201.57,205.95,257.33,266,205.95,198.0,201.57
+Managed switch to Quark/Tandem B8,earlier profile,prose,3,158.2,156.99,161.43,191.33,200,156.99,156.17,161.43
 Original vLLM-MX,300W stream-timing rerun,code,3,185.75,185.32,189.75,261,279,189.75,182.19,185.32
 Original vLLM-MX,300W stream-timing rerun,prose,3,133.93,136.52,145.62,189.33,221,136.52,145.62,119.64
 "Public Saber CLI, Quark + Tandem B16",CPU calibrated,code,3,229.09,227.63,235.65,333,345,224.0,227.63,235.65

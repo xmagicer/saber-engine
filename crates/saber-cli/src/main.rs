@@ -2184,6 +2184,10 @@ enum Cmd {
         #[arg(long, default_value = "walk", value_parser = ["walk", "explen", "tandem-b16-calibrated"])]
         engine_selector_rank: String,
 
+        /// Score the full FP8 vocabulary for single-request native TP2 B8 proposals.
+        #[arg(long)]
+        engine_draft_full_vocab: bool,
+
         /// --engine real: `ancestor9` (default, root + 9 candidates), `best16` (root + 15
         /// candidates using the existing 6-wave attention/tree objects, requires max-seqs=1),
         /// or `off` (the chain). The ordinary decode width limit is unchanged.
@@ -3096,6 +3100,10 @@ enum Cmd {
         #[arg(long, default_value = "walk", value_parser = ["walk", "explen", "tandem-b16-calibrated"])]
         selector_rank: String,
 
+        /// Score the full FP8 vocabulary for single-request native TP2 B8 proposals.
+        #[arg(long)]
+        draft_full_vocab: bool,
+
         /// P27-15c: the verify's row form, `ancestor9` (the tree; the default since P27-W2-4) or `off`
         /// (the chain; the control; refused by name and run as `off` where the boot cannot run it)
         /// (`ancestor9-pair` = P27-15f's two-record control: engine / worker only)
@@ -3286,6 +3294,10 @@ enum Cmd {
         /// The leader's selector rank form (P27-12), forwarded by value: one block digest
         #[arg(long, default_value = "walk", value_parser = ["walk", "explen", "tandem-b16-calibrated"])]
         selector_rank: String,
+
+        /// Score the full FP8 vocabulary for single-request native TP2 B8 proposals.
+        #[arg(long)]
+        draft_full_vocab: bool,
 
         /// P27-15c: the verify's row form, `ancestor9` (the tree; the default since P27-W2-4) or `off`
         /// (the chain; the control; refused by name and run as `off` where the boot cannot run it)
@@ -4916,6 +4928,7 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
             engine_draft_kv,
             engine_draft_embed_share,
             engine_selector_rank,
+            engine_draft_full_vocab,
             engine_spec_tree,
             engine_spec_tree_sampled,
             engine_gdn_replay,
@@ -5148,6 +5161,7 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
                         draft_store_deferred: engine_drafter_store == "deferred",
                         draft_kv_paged: engine_draft_kv == "paged",
                         draft_embed_share: engine_draft_embed_share == "on",
+                        draft_full_vocab: engine_draft_full_vocab,
                         selector_rank: saber_engine::selector_rank::SelectorRank::parse(
                             &engine_selector_rank,
                         )
@@ -5460,6 +5474,7 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
             draft_kv,
             draft_embed_share,
             selector_rank,
+            draft_full_vocab,
             spec_tree,
             spec_tree_sampled,
             gdn_replay,
@@ -5596,6 +5611,7 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
                     draft_store_deferred: drafter_store == "deferred",
                     draft_kv_paged: draft_kv == "paged",
                     draft_embed_share: draft_embed_share == "on",
+                    draft_full_vocab,
                     host_levers: saber_engine::host_levers::HostLevers::parse(&host_levers)
                         .unwrap_or_default(),
                     device_step: saber_engine::device_step::DeviceStep::parse(&device_step)
@@ -5750,6 +5766,7 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
             draft_kv,
             draft_embed_share,
             selector_rank,
+            draft_full_vocab,
             spec_tree,
             spec_tree_sampled,
             gdn_replay,
@@ -5872,6 +5889,7 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
                 draft_store_deferred: false,
                 draft_kv_paged: draft_kv == "paged",
                 draft_embed_share: draft_embed_share == "on",
+                draft_full_vocab,
                 host_levers: saber_engine::host_levers::HostLevers::parse(&host_levers)
                     .unwrap_or_default(),
                 device_step: saber_engine::device_step::DeviceStep::parse(&device_step)
