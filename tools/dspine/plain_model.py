@@ -13,9 +13,19 @@ import target_layers as TargetLayers
 
 
 def rms_norm(x, weight, eps):
+    """SGLang RMSNorm default: multiply the weight in FP32, then round once.
+
+    The DSpine bridge's fused next-norm has its own explicitly two-round BF16
+    contract in reference.feature_finish; it must not be reused here.
+    """
     v = x.float()
-    y = (v * torch.rsqrt(v.square().mean(-1, keepdim=True) + eps)).to(torch.bfloat16)
-    return (y.float() * weight.float()).to(torch.bfloat16)
+    return (v * torch.rsqrt(v.square().mean(-1, keepdim=True) + eps) * weight.float()).to(torch.bfloat16)
+
+
+def add_rms_norm(x,residual,weight,eps):
+    """Normalize the FP32 residual sum; separately store its BF16 residual."""
+    full=x.float()+residual.float()
+    return rms_norm(full,weight,eps),full.to(torch.bfloat16)
 
 
 class TorchDspine:
@@ -161,8 +171,7 @@ class TorchDspine:
             attended=torch.nn.functional.scaled_dot_product_attention(q,k,v,attn_mask=mask[None,None],dropout_p=0.0)
             attended=attended[0].transpose(0,1).reshape(t,self.qheads*self.dim).contiguous()
             projected=self.linear(attended,self.w[attn+'o_proj.weight'])
-            residual=(residual.float()+projected.float()).to(torch.bfloat16)
-            mlp_input=rms_norm(residual,self.w[prefix+'post_attention_layernorm.weight'],self.eps)
+            mlp_input,residual=add_rms_norm(projected,residual,self.w[prefix+'post_attention_layernorm.weight'],self.eps)
             gate=self.linear(mlp_input,self.w[prefix+'mlp.gate_proj.weight'])
             up=self.linear(mlp_input,self.w[prefix+'mlp.up_proj.weight'])
             glu=(torch.nn.functional.silu(gate.float())*up.float()).to(torch.bfloat16)

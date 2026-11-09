@@ -130,7 +130,7 @@ def build_serial_tables(lm_head, norm_weight, write_weight, predecessor_value_we
 
 @torch.no_grad()
 def serial_table(raw, norm_weight, candidates, input_ids, lm_head, tg, tsv, packed,
-                 rms, gate_bias, block_size):
+                 rms, gate_bias, block_size, with_log_probabilities=False):
     require_bf16(raw, packed, lm_head, norm_weight, tg, tsv)
     m, h = raw.shape
     whole_blocks(m, block_size)
@@ -146,6 +146,7 @@ def serial_table(raw, norm_weight, candidates, input_ids, lm_head, tg, tsv, pack
         raise ValueError("candidate lanes must be sorted by id; K is a power of two in [2,64]")
     idx = torch.empty_like(candidates)
     confidence = torch.empty((n, k), dtype=torch.float32, device=raw.device)
+    log_probabilities = torch.empty((n,k,k),dtype=torch.float32,device=raw.device) if with_log_probabilities else None
     ids_flat = input_ids.reshape(-1)
     for at in range(n):
         b, pos = divmod(at, block_size-1)
@@ -162,6 +163,11 @@ def serial_table(raw, norm_weight, candidates, input_ids, lm_head, tg, tsv, pack
         best, idx[at] = torch.max(score, dim=1)
         scale = torch.clamp(rms[row].float(), min=1e-6)
         confidence[at] = 1.0 / torch.exp((score-best[:, None])/scale).sum(-1)
+        if log_probabilities is not None:
+            normalized=(score-best[:,None])/scale
+            log_probabilities[at]=normalized-torch.logsumexp(normalized,dim=-1,keepdim=True)
+    if log_probabilities is not None:
+        return idx,confidence,log_probabilities
     return idx, confidence
 
 

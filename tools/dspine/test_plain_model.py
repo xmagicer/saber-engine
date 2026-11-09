@@ -9,6 +9,23 @@ except ModuleNotFoundError:
 
 @unittest.skipUnless(torch is not None,'PyTorch required')
 class PlainModelTests(unittest.TestCase):
+    def test_sglang_backbone_norm_multiplies_before_bf16_rounding(self):
+        x=torch.tensor([[.030029296875,1.]],dtype=torch.bfloat16)
+        weight=torch.tensor([1.296875,1.],dtype=torch.bfloat16)
+        actual=Model.rms_norm(x,weight,1e-6)
+        self.assertEqual(float(actual[0,0]),.054931640625)
+        # Independent analytic scalar result differs from the HF-style early cast.
+        self.assertNotEqual(float(actual[0,0]),.05517578125)
+
+    def test_fused_norm_uses_unrounded_sum_and_stores_rounded_residual(self):
+        x=torch.tensor([[.030029296875,.030029296875]],dtype=torch.bfloat16)
+        residual=torch.tensor([[.01171875,.10009765625]],dtype=torch.bfloat16)
+        weight=torch.tensor([1.296875,1.],dtype=torch.bfloat16)
+        normalized,stored=Model.add_rms_norm(x,residual,weight,1e-6)
+        self.assertEqual(float(normalized[0,0]),.55859375)
+        self.assertNotEqual(float(normalized[0,0]),.5625)
+        self.assertTrue(torch.equal(stored,torch.tensor([[.041748046875,.130126953125]],dtype=torch.bfloat16)))
+
     def model(self):
         torch.manual_seed(9)
         h,d,q,k,layers,c,r,v=8,4,2,1,2,4,2,16

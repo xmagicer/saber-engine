@@ -75,6 +75,16 @@ class BridgeReferenceTests(unittest.TestCase):
                 expected.append(previous)
         self.assertEqual(output.tolist(), expected)
         self.assertTrue(bool(((selected > 0) & (selected <= 1)).all()))
+        expanded,probabilities,edges=Ref.serial_table(raw,norm,cand,ids,head,tg,tsv,
+            self.bf16([[0,0,0]]*6),torch.ones(6),self.bf16([0]),3,with_log_probabilities=True)
+        self.assertTrue(torch.equal(idx,expanded));self.assertTrue(torch.equal(conf,probabilities))
+        for row in range(4):
+            block,pos=divmod(row,2)
+            for lane in range(2):
+                previous=int(ids[block*3]) if pos==0 else int(cand[row-1,lane])
+                state=raw[block*3+1+pos].float()+float(book[previous,0])/2*write[:,0].float()
+                direct=torch.mv(head[cand[row]].float(),state).log_softmax(-1)
+                self.assertTrue(torch.allclose(edges[row,lane],direct,atol=1e-6,rtol=1e-6))
 
     def test_greedy_ties_choose_lower_candidate_lane_and_chains_reset(self):
         idx = torch.tensor([[1,1],[1,0],[0,0],[1,1]],dtype=torch.int64)
