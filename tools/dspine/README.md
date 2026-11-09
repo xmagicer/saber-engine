@@ -10,6 +10,13 @@ This directory includes numerical reference tools and an experimental DSpine ser
 - `native_linear.py` experimentally replaces the draft's large projections with group-128 W8A8 code objects. This changes draft numerics and needs measured acceptance validation. BF16 bridge and serial-table math stay unchanged.
 - `graph_model.py` captures fixed proposal shapes with padded teacher-cache staging. Invalid absolute positions mask padding; speculative query K/V never enters the committed cache. The group-128 model passed GPU comparisons with changing teacher histories, future queries and padding contents.
 
+The INT2 candidate filter orders equal coarse scores by ascending vocabulary ID before the FP32 rerank. On ROCm an unqualified floating-point top-k selected different candidate sets across runs on tied scores. The GPU regression exercises both the block and dense modes with tied activations and tests each device independently.
+
+```sh
+python3 tools/dspine/gpu_head_gate.py --device cuda:0 --prebuilt prebuilt/gfx1201
+python3 tools/dspine/gpu_head_gate.py --device cuda:1 --prebuilt prebuilt/gfx1201
+```
+
 Run CPU checks with PyTorch installed:
 
 ```sh

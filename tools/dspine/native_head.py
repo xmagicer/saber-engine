@@ -39,6 +39,8 @@ class NativeSparseHead:
 
     @torch.no_grad()
     def candidates(self,hidden,head,k=16,pool_per_shard=256,coarse_mode="block"):
+        import canonical_coarse
+
         if coarse_mode not in ["block","dense"]:raise ValueError("Unknown coarse candidate mode")
         if hidden.ndim!=2 or hidden.shape[1]!=self.hidden or hidden.dtype!=torch.bfloat16 or not hidden.is_cuda:raise ValueError('Expected CUDA BF16 hidden rows')
         live=hidden.shape[0];rows=max(16,1<<(live-1).bit_length())
@@ -56,8 +58,10 @@ class NativeSparseHead:
             if coarse_mode=='dense':name=name.removesuffix('_topk')
             self.module.launch(name,(nblk,rows//16,1),(64,1,1),{'x':x,'xs':xs,'wq':shard['wq'],'s':shard['s'],'zs':shard['zs'],'y':coarse,'bmax':maxima,'bidx':indices,'m':rows,'n':n,'k':self.hidden,'stride_wq':self.hidden//4,'stride_s':self.hidden//128,'stride_xs':self.hidden//128,'nblk':nblk})
             if coarse_mode=='dense':
-                pools.append(torch.topk(coarse[:live].float(),pool_per_shard,dim=-1).indices+shard['base'])
+                local_ids = torch.arange(n, dtype=torch.int32, device=hidden.device).expand(live,n).contiguous()
+                positions = canonical_coarse.positions(coarse[:live].float(),local_ids,pool_per_shard)
+                pools.append(positions+shard['base'])
             else:
-                positions=torch.topk(maxima[:live],pool_per_shard,dim=-1).indices
+                positions=canonical_coarse.positions(maxima[:live],indices[:live],pool_per_shard)
                 pools.append(torch.gather(indices[:live].long(),1,positions)+shard['base'])
         return exact_candidate_topk(hidden,head,torch.cat(pools,dim=-1),k)
