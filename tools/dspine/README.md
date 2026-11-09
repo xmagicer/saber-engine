@@ -21,15 +21,15 @@ The opt-in target capture requires one sequence, prefix caching off and the chai
 ```sh
 saber serve ... --engine-max-seqs 1 --enable-prefix-caching off --engine-spec-tree off \
   --engine-draft-capture-dir /private/new-directory \
-  --engine-draft-capture-layers 1,16,31,46,61
+  --engine-draft-capture-layers 2,17,32,47,62
 ```
 
-The DSpine taps differ from DFlash2's `[5,19,33,47,61]`. Capture uses an independently allocated plane so the resident DFlash2 proposal remains unchanged. Export directories/files use modes 0700/0600; existing directories are refused.
+The checkpoint's `[1,16,31,46,61]` are **zero-based decoder output** ids. Saber's `lN.resid.a` is the residual entering layer N, so the actual capture points are **`[2,17,32,47,62]`**. `target_layers.py` performs this mapping and rejects captures using the unshifted list. Do not apply this DSpine-specific convention to an older DFlash2 pack automatically. Capture uses an independently allocated plane so the resident DFlash2 proposal remains unchanged. Export directories/files use modes 0700/0600; existing directories are refused.
 
 Verified on a real gfx1201 GPU: upstream Triton bridge parity with the BF16 checkpoint, and no-future-feature replay against captured target outputs. The eager BF16 implementation takes about 16-17 ms per proposal on the tested setup; this is an acceptance experiment, not end-to-end serving throughput. It needs an optimized proposer before it can offer a serving speedup.
 
-Native group-128 W8A8 projections passed independent logical-matrix and varying-input graph checks. On the matched Quark-core target trajectory, the B16 proposer committed about 5.71 code tokens or 3.40 prose tokens per verification round. A graph with an approximate int2/80-candidate head retained about 5.64/3.40 while reducing proposal wall time to about 13.5 ms on one GPU. This still exceeds the resident TP=2 DFlash2 proposer's cost and has not been adopted for serving.
+Native group-128 W8A8 projections passed independent logical-matrix and varying-input graph checks. **Earlier acceptance measurements used the unshifted capture ids and are invalid as DSpine quality results.** The low-level numerical/causality checks remain useful, but acceptance must be remeasured with correctly captured decoder outputs. This work has not been adopted for serving.
 
 The channel-FP8 W8A16 variant is a separate numerical experiment. Its isolated projections passed matrix and graph checks, but its actual model comparison between padded graphs and the unpadded eager reference exceeded the current absolute-error gate. That graph variant has not passed acceptance; do not enable it based on the isolated matrix checks.
 
-A same-power daytime comparison therefore kept the channel variant **eager**: group-128 graph proposals took 12.85/12.72 ms for code/prose, while channel-FP8 eager proposals took 10.64/10.50 ms. Mean committed tokens were 5.64/3.40 and 5.74/3.42 respectively on the same two target trajectories. These are single-GPU offline measurements, not live service throughput or three-prompt medians; TP=2 serving integration remains incomplete.
+A same-power daytime comparison kept the channel variant **eager** and measured roughly 10.6 ms per proposal on one GPU. This was also collected with the incorrect feature-layer inputs; it is not evidence of a correct DSpine deployment or live service throughput. Corrected acceptance and performance replay is pending; TP=2 serving integration remains incomplete.

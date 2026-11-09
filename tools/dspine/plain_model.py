@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import torch
 import reference as Ref
+import target_layers as TargetLayers
 
 
 def rms_norm(x, weight, eps):
@@ -55,6 +56,7 @@ class TorchDspine:
                 raise ValueError('This reference supports BF16 only: '+name)
         self.device = weights['fc.weight'].device
         self.target_features = len(d['target_layer_ids'])
+        self.capture_layer_ids = TargetLayers.capture_layers_from_dspine(d['target_layer_ids'])
         if weights['fc.weight'].shape!=(self.h,self.target_features*self.h):
             raise ValueError('Target auxiliary projection shape mismatch')
         self.packed = Ref.pack_bridge_weights(weights['selected_prefix_bridge.gate.weight'],
