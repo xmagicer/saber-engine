@@ -105,12 +105,38 @@ pub struct StepIndex<'a> {
     /// Empty means "every slot committed one token", which is the SPEC=0 answer and the answer for
     /// a sequence's first decode step after its prompt.
     pub committed_before: &'a [u32],
-    /// A decode ROW BAND's max verify width (C2), `None` for a rectangle — the shared law's
-    /// [`saber_exec::forward::StepIndex::band_width`], passed through.
+    /// The shared packed-table width for a row band or single-slot scalar snapshot
+    /// transition. Rectangles normally infer it from their live dimensions.
     pub band_width: Option<u32>,
 }
 
 impl<'a> StepIndex<'a> {
+    /// A single-slot scalar decode may follow a wider commit. Its kernels read
+    /// the previous recurrent snapshot at `sidx[naccept - 1]` and write the
+    /// new one at `sidx[0]`. The conv kernel opens `cache_idx[0]` at token
+    /// offset `naccept - 1`. For slot zero all per-slot stride products are
+    /// zero, so the packed single-slot table law can supply a longer `sidx`
+    /// without changing the actual one-row query, its KV position, or either
+    /// kernel's one-row output geometry. Both ranks consume this staged blob.
+    pub(crate) fn with_scalar_snapshot_span(
+        mut self,
+        state_width: u32,
+    ) -> Result<Self, IndexError> {
+        if self.phase == Phase::Decode && self.rows == 1 && self.band_width.is_none() {
+            if let ([seq], [committed]) = (self.seqs, self.committed_before) {
+                if seq.live_rows == 1 && *committed > 1 {
+                    if *committed > state_width {
+                        return Err(IndexError::Step(format!(
+                            "scalar step needs snapshot {committed} but the session owns {state_width}"
+                        )));
+                    }
+                    self.band_width = Some(*committed);
+                }
+            }
+        }
+        Ok(self)
+    }
+
     /// Rows the live sequences feed, summed.
     #[must_use]
     pub fn live_rows(&self) -> u32 {
@@ -830,6 +856,84 @@ mod tests {
             live_rows: rows,
             rope: None,
         }
+    }
+
+    #[test]
+    fn scalar_tail_reads_the_previous_wide_snapshot_and_writes_one_live_row() {
+        let pages: Vec<u32> = (0..16).collect();
+        let seqs = [live(17, 255, &pages, 1)];
+        for count in [2u32, 5, 8, 10, 16] {
+            let accepted = [count];
+            let index = StepIndex {
+                phase: Phase::Decode,
+                rows: 1,
+                max_blocks: 16,
+                seqs: &seqs,
+                ids: &[1234],
+                committed_before: &accepted,
+                band_width: None,
+            };
+            assert!(
+                index.check().is_err(),
+                "the narrow sidx cannot hold the previous read"
+            );
+            let tail = index
+                .with_scalar_snapshot_span(16)
+                .expect("allocated state span");
+            tail.check()
+                .expect("scalar step at the last target position");
+            let table = |key: &str| index_table_for(key, &tail, AttnQLen::Live).unwrap();
+            let sidx = table("l0.gdn.sidx");
+            let words: Vec<i32> = sidx
+                .chunks_exact(4)
+                .map(|w| i32::from_le_bytes(w.try_into().unwrap()))
+                .collect();
+            assert_eq!(words[0], 17, "current scalar snapshot destination");
+            assert_eq!(
+                words[count as usize - 1],
+                17 + count as i32 - 1,
+                "previous accepted snapshot"
+            );
+            assert_eq!(table("l0.gdn.naccept"), i32_bytes(&[count as i32]));
+            assert_eq!(table("l0.gdn.cache_idx"), i32_bytes(&[17]));
+            assert_eq!(table("l0.gdn.cu"), i32_bytes(&[0, 1]));
+            assert_eq!(table("l3.attn.seqused_k"), i32_bytes(&[256]));
+            let ordinary = StepIndex {
+                committed_before: &[1],
+                ..index
+            };
+            for key in [
+                "embed_tokens.ids",
+                "l3.attn.pos",
+                "l3.attn.slot",
+                "l3.attn.block_table",
+                "l3.attn.seqused_k",
+                "l0.gdn.cu",
+            ] {
+                assert_eq!(
+                    table(key),
+                    index_table_for(key, &ordinary, AttnQLen::Live).unwrap(),
+                    "{key}"
+                );
+            }
+            assert!(index.with_scalar_snapshot_span(count - 1).is_err());
+        }
+        // Multiple slots cannot borrow this layout: their encoded stride is no longer irrelevant.
+        let slots = [live(1, 255, &pages, 1), live(17, 255, &pages, 1)];
+        let multi = StepIndex {
+            phase: Phase::Decode,
+            rows: 2,
+            max_blocks: 16,
+            seqs: &slots,
+            ids: &[1, 2],
+            committed_before: &[5, 1],
+            band_width: None,
+        };
+        assert!(multi
+            .with_scalar_snapshot_span(16)
+            .unwrap()
+            .check()
+            .is_err());
     }
 
     #[test]

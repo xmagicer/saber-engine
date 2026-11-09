@@ -13,7 +13,7 @@ cargo run --release -p saber-mem --bin saber-pack-verify -- \
 ```
 
 The builder verifies every record after writing and rebuilds SBR record, chunk, table and tier digests. The Rust verifier independently opens the result with the runtime reader and hashes all records. Neither integrity check substitutes for generation and tool-call validation; run those before benchmarking or selecting the control for serving.
-# B16-trained DFlash2 weights
+# Fine-tuned DFlash2 weights
 
 The optional native drafter importer accepts the [TandemLLM B16 checkpoint](https://huggingface.co/0xBakeer/TandemLLM-Qwen3.8-27B-DFlash2-b16/tree/98759a4995e4949c462f9a6197f59e015fd82530). The author distributes the weights under Apache-2.0. The tested file has 3,848,817,896 bytes and SHA-256 `843d7698e043118863847a560b0375e93db253f00352282d20ff0d6b6816356a`.
 
@@ -25,5 +25,7 @@ cargo run --release -p saber-mem --bin saber-pack-verify -- /packs/qwen38-dflash
 ```
 
 The old checkpoint control reproduced all 89 learned records per rank byte for byte. The importer consumed all 81 BF16 parameters of the new checkpoint. The runtime reader verified 96 records in each output shard. The teacher KV matrix follows the multiplication order of an identity input through the quantized projection before BF16 rounding.
+
+The same converter accepts the [block-8 checkpoint](https://huggingface.co/0xBakeer/TandemLLM-Qwen3.8-27B-DFlash2-b8/tree/ecf60b9b0cfbf7b70e68d8d11b5eb2843c405a98). Select its exact revision `ecf60b9b0cfbf7b70e68d8d11b5eb2843c405a98`, pass its weight SHA-256 `32ed444f1b2e1d443f9330a5d1c6e3dc9dcfee648eba9f282a1a351dab582f02`, and use a fresh output directory. Both checkpoints have the same matrix shapes. The training block size comes from `dflash_config.block_size`.
 
 For one active sequence set `DRAFT=qwen38-dflash2-tandem-b16-fp8head`, `DRAFT_BLOCK=16`, `MAX_SEQS=1` and `BATCHES=1`. Use `WIDTHS=1,16` with `--engine-spec-tree best16`, or `WIDTHS=1,10` with `--engine-spec-tree ancestor9`. Both runs use `--engine-gdn-replay off` and the host collective options in the [deployment guide](../../docs/HOST-COLLECTIVES.zh-CN.md).

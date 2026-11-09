@@ -88,3 +88,16 @@ DSpine 的在线 TP=2 实验已能通过真实 HTTP 请求生成文本。两张�
 | Quark，B16 专训权重，15 节点 | 214.32 | 150.93 |
 
 16 行实现还支持将 48 层 GDN 状态提交合为一次派发，按 16 行记录单独选核。两张卡的状态对照逐位一致。当前机器这项改变的整机收益较小，Quark 15 节点复测为 209.38 / 152.97 tok/s。单序列 B16 的包转换、复核命令与可选启动参数见[权重工具说明](../tools/weights/README.md)。
+
+固定输出测试中，生成更快的组合使用匹配 Quark 主干、B16 专训权重和 8 行运行块。使用前述运行镜像、RCCL 与共享目录配置，可以在独立端口复现。
+
+```sh
+TIER=qwen38-27b-quark-matched-core-fp8head DRAFT=qwen38-dflash2-tandem-b16-fp8head \
+  MAX_CTX=262144 MAX_SEQS=8 BATCHES=1,2,3,4,8 WIDTHS=1,8 DRAFT_BLOCK=8 \
+  HOST=127.0.0.1 PORT=18081 CNAME=saber-tandem-check MODEL=qwen3.8-27b-mxfp4 \
+  tools/serve_27b.sh --tp 2 --no-build --engine-host-ar --enable-prefix-caching on
+```
+
+完整 57 个请求中的单路三次中位数为代码 **218.34**、长文 **163.77** tok/s，另一次六请求复测分别为 **222.99** 和 **162.52**。8 路合计 **517.62 tok/s**。245,762-token 检索正确。完整测试的 128K 首 token 为 **67.43 秒**，原生产配置同组长请求的复测为 **63.36 秒**。
+
+训练块和运行块可以分别验证。在相同的 Quark 主干与 8 行运行块下，单独按 8 行训练的检查点得到 **217.06 / 151.22 tok/s**。对本次六个请求，按 16 行训练的检查点在 8 行运行时效果更好。

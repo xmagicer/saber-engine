@@ -3162,6 +3162,8 @@ struct Geom {
     max_ctx: u32,
     max_blocks: u32,
     block_size: u32,
+    /// Reserved consecutive recurrent snapshots per live sequence.
+    state_width: u32,
 }
 
 /// One sequence's session facts.
@@ -8776,6 +8778,7 @@ fn run(
         max_ctx: cfg.max_ctx,
         max_blocks,
         block_size,
+        state_width: max_width,
     };
     let host_gathers = Arc::new(AtomicU64::new(0));
     // THE PER-STEP HOST CLOCK (ws-h31). Armed from the config so that rank 1, which has no handle
@@ -21390,7 +21393,9 @@ fn decode_step(
         ids: &ids,
         committed_before: &committed_before,
         band_width: band.map(|_| width),
-    };
+    }
+    .with_scalar_snapshot_span(geom.state_width)
+    .map_err(|error| ForwardError::Device(error.to_string()))?;
     // A DECODE STEP'S ATTENTION IS ITS BUCKET'S: every live slot feeds the verify width (a shorter
     // one is refused above), so the chunk's rows and the bucket's are one number and `Live` is the
     // reading. `attn_decode` refuses any other, because there `q_len` is also the `sidx` block
