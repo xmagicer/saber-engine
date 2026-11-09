@@ -2692,27 +2692,26 @@ pub fn check_plugins_declared(
     manifest: &PlanManifest,
     model: &crate::ModelSpec,
 ) -> Result<()> {
-    // A row is bindable when the model selects its op AND carries every key its constraints test:
-    // a predicate on a key no op of that name states can never hold. That is the f16 stored-state
-    // rows (C1): they test `state_dtype`, which this model's shape keys do not carry, because the
-    // stored dtype is a property of the ENGINE's graph (`Graph::with_gdn_state_f16`), resolved by
-    // `saber::resolve` off the op's own state -- declaring their plugins here would re-key every
-    // autotune record for a route this plan cannot bind.
+    // Use the same bucket geometry and call count as resolve(). The narrow and
+    // 16-query uniform heads share an op and keys but have disjoint widths.
     let bindable = |i: &crate::registry::Implementation| {
         model.ops.iter().filter(|o| o.op == i.op).any(|o| {
-            [crate::plan::Phase::Decode, crate::plan::Phase::Prefill]
-                .into_iter()
-                .any(|ph| {
-                    let keys = o.shape_keys(ph, 1, 1, 1, 1);
-                    i.constraints.iter().all(|c| keys.get(&c.key).is_some())
-                })
+            manifest.buckets.iter().any(|section| {
+                let b = manifest.bucket(section);
+                o.calls_in(b.phase, b.batch, b.m()) != 0
+                    && i.matches(&o.shape_keys(b.phase, b.m(), b.batch, b.spec_width, b.ctx_band))
+                        .is_ok()
+            })
         })
     };
     let mut missing: Vec<&str> = registry
         .implementations()
         .iter()
         .filter(|i| bindable(i))
-        .map(|i| i.plugin.as_str())
+        .flat_map(|i| {
+            std::iter::once(i.plugin.as_str())
+                .chain(saber_kernels::companion_plugins(&i.plugin).iter().copied())
+        })
         .filter(|p| manifest.plugin(p).is_none())
         .collect();
     missing.sort_unstable();
@@ -3324,6 +3323,42 @@ mod tests {
         for rows in by_bucket.values() {
             let op = model.op(&rows[0].0).expect("model op");
             assert_eq!(op.count, 128);
+        }
+    }
+
+    #[test]
+    fn uniform16_manifest_declares_both_dispatches_and_keys_both_policies() {
+        let source = include_str!("../../../examples/qwen38-27b-nvfp4-tp2-w16.toml");
+        let manifest = PlanManifest::from_str(source, "uniform16").expect("wide plan");
+        let model = crate::ModelSpec::qwen38_27b_dense(manifest.device.tp).unwrap();
+        let device = crate::DeviceProfile::gfx1201_reference();
+        let registry = registry_from_prebuilt(&saber_kernels::prebuilt::dir()).unwrap();
+        check_plugins_declared(&registry, &manifest, &model).unwrap();
+        let resolved =
+            crate::resolve(&manifest, &device, &model, &registry).expect("wide resolution");
+        let requirements = resolved.requirements();
+        let attention = requirements
+            .iter()
+            .find(|r| r.key.op == "attn_decode_paged")
+            .unwrap();
+        assert_eq!(
+            attention.candidates,
+            ["attn_decode_uniform16_h256_gqa6_fp8kv"]
+        );
+        let tables: BTreeMap<_, _> = saber_kernels::committed_rule_tables()
+            .into_iter()
+            .filter(|(file, _)| {
+                matches!(*file, "saber_gfx1201.toml" | "saber_uniform16_gfx1201.toml")
+            })
+            .map(|(file, text)| (file, crate::hash::digest_of(&text)))
+            .collect();
+        assert_eq!(tables.len(), 2);
+        assert_eq!(attention.key.policy_digest, crate::hash::digest_of(&tables));
+        for required in ["saber_attn", "saber_attn16"] {
+            let mut missing = manifest.clone();
+            missing.plugins.retain(|plugin| plugin.name != required);
+            let error = check_plugins_declared(&registry, &missing, &model).unwrap_err();
+            assert!(error.to_string().contains(required), "{error}");
         }
     }
 

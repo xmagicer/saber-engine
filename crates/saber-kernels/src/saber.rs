@@ -475,6 +475,16 @@ pub const PROD_RULES_TEXT: &str = PROD_RULES;
 /// per-table policy digest re-keys only the ragged route's records, never an rx6 route's.
 pub const RAGGED_RULES_TEXT: &str = include_str!("../rules/saber_ragged_gfx1201.toml");
 
+/// The separately compiled uniform 16-query head has its own policy digest.
+pub const UNIFORM16_RULES_TEXT: &str = include_str!("../rules/saber_uniform16_gfx1201.toml");
+
+#[derive(Deserialize)]
+struct Uniform16Table {
+    schema_version: u32,
+    registry: Vec<RegistryRow>,
+    attn_decode: Vec<DecodeRow>,
+}
+
 /// The rows `saber_ragged_gfx1201.toml` carries: registry entries under
 /// [`ATTN_DECODE_RAGGED_OP`] and their instantiations.
 #[derive(Debug, Clone, Deserialize)]
@@ -557,7 +567,27 @@ impl SaberRules {
     /// The rules the `qwen_prod_nvfp4` unit runs today (reference rx6, TP=2, MAXSEQS=8), plus the
     /// RAGGED decode attention's own table (C2, [`RAGGED_RULES_TEXT`]).
     pub fn prod_saber() -> Result<Self> {
-        Self::from_toml(PROD_RULES)?.with_ragged_toml(RAGGED_RULES_TEXT)
+        let mut rules = Self::from_toml(PROD_RULES)?.with_ragged_toml(RAGGED_RULES_TEXT)?;
+        let wide: Uniform16Table =
+            toml::from_str(UNIFORM16_RULES_TEXT).map_err(|e| Error::Parse(e.to_string()))?;
+        if wide.schema_version != rules.schema_version
+            || wide.registry.iter().any(|row| {
+                row.op != "attn_decode_paged"
+                    || !row
+                        .constraints
+                        .iter()
+                        .any(|c| c.key == "q_len" && c.op == ConstraintOp::Eq && c.ival == 16)
+            })
+            || wide
+                .attn_decode
+                .iter()
+                .any(|row| row.nw != 6 || plugin_for(&row.symbol).ok() != Some("saber_attn16"))
+        {
+            return Err(Error::Rule("invalid uniform16 rules table".into()));
+        }
+        rules.registry.extend(wide.registry);
+        rules.attn_decode.extend(wide.attn_decode);
+        Ok(rules)
     }
 
     /// Merge a ragged-attention table (C2) into these rules: its registry rows (op

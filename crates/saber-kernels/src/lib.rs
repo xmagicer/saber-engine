@@ -79,12 +79,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// to the plan input hash, and every record went on binding the variant the old policy chose. The
 /// list is now derived from the directory by a test rather than by memory (docs/LEDGER.md, I17).
 #[must_use]
-pub fn committed_rule_tables() -> [(&'static str, &'static str); 11] {
+pub fn committed_rule_tables() -> [(&'static str, &'static str); 12] {
     [
         ("mxfp4_gfx1201.toml", rules::PROD_RULES_TEXT),
         ("saber_gfx1201.toml", saber::PROD_RULES_TEXT),
         // C2's ragged decode attention, its own table so its edits re-key only its own route.
         ("saber_ragged_gfx1201.toml", saber::RAGGED_RULES_TEXT),
+        ("saber_uniform16_gfx1201.toml", saber::UNIFORM16_RULES_TEXT),
         ("paro_gfx1201.toml", paro::PROD_RULES_TEXT),
         ("head_gfx1201.toml", head::PROD_RULES_TEXT),
         ("noop_gfx1201.toml", noop::PROD_RULES_TEXT),
@@ -256,6 +257,7 @@ pub fn rule_table_for_plugin(plugin: &str) -> Option<&'static str> {
         "saber_device_row_stage" => "noop_gfx1201.toml",
         p if p.starts_with("mxfp4_") => "mxfp4_gfx1201.toml",
         "saber_attn_ragged" => "saber_ragged_gfx1201.toml",
+        "saber_attn16" => "saber_uniform16_gfx1201.toml",
         p if p.starts_with("saber_") => "saber_gfx1201.toml",
         p if p.starts_with("dflash_") => "dflash_gfx1201.toml",
         // CMP27F: the fp8 head's one-pass 64-row tile is a route of the dflash head rules
@@ -263,6 +265,15 @@ pub fn rule_table_for_plugin(plugin: &str) -> Option<&'static str> {
         "saber_head_w8_m64" => "dflash_gfx1201.toml",
         _ => return None,
     })
+}
+
+/// Additional executable objects needed by a registry entry's head object.
+pub fn companion_plugins(plugin: &str) -> &'static [&'static str] {
+    match plugin {
+        // The W16 head writes partials for the uniform combine in saber_attn.
+        "saber_attn16" => &["saber_attn"],
+        _ => &[],
+    }
 }
 
 pub mod prebuilt {
