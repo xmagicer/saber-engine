@@ -184,7 +184,7 @@ pub fn rule_table_for_plugin(plugin: &str) -> Option<&'static str> {
         // FN114b: the flag-in-data exact reduce (`--fn-ar ll`); the executor names it.
         "flashnext_ar" => "noop_gfx1201.toml",
         // FN114d: the global-parity one-shot reduces (`--fn-ar gp`); the executor names them.
-        "flashnext_ar_gp" => "noop_gfx1201.toml",
+        "flashnext_ar_gp" | "flashnext_ar_host" => "noop_gfx1201.toml",
         // FN50: the MTP experts' mixed-table GEMMs (FN6's bodies, one skip line each). No policy
         // row binds them: the fp8 arm's geometry is FN6's (16-row tiles, the bf16 split rows).
         "flashnext_mtp8" => "noop_gfx1201.toml",
@@ -634,6 +634,7 @@ pub mod prebuilt {
         // the data); the one-shot's vadd verbatim. Its own object so `saber_ar_exact` keeps its
         // bytes; `_chk` / `_chkctl` are its race checker and the checker's control.
         ("flashnext_ar.hsaco", "fn_ar_ll_exact_bf16"),
+        ("flashnext_ar_host.hsaco", "fn_ar_host_exact_bf16"),
         // Flash-Next (FN114d, `--fn-ar gp`): the exact / wht6 one-shot bodies (an instantiation
         // table of the same headers as `saber_ar_exact` / `saber_ar_wht`) with the workspace slot
         // chosen by the call's global parity; its own object so those keep their bytes; `_chk` =

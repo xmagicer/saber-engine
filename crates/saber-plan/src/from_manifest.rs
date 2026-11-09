@@ -370,6 +370,10 @@ pub const SEPARATELY_PLANNED: &[(&str, &str)] = &[
          text plan",
     ),
     (
+        "flashnext_ar_host",
+        "Flash-Next TP2 exact BF16 over registered host memory, selected only by --fn-ar host",
+    ),
+    (
         "flashnext_couple",
         "Flash-Next (LR-N): coupled drafting -- the MTP chain tail drafts a sampled row with the \
          target's own noise at the draft's verify position (the target's tokens unchanged) -- \

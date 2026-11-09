@@ -242,6 +242,21 @@ Environment variables (put them before the command):
 
 ### Flash-Next: `tools/serve_flashnext.sh [flags]` (model id `Qwen3.8-Flash-Next`)
 
+For two gfx1201 GPUs without direct peer-memory access, select
+`--fn-ar host --fn-mtp 0` on the two-worker launcher. This uses registered
+shared host pages and exact BF16 reductions. At the default 8,192-row maximum
+chunk, the two double-buffered mailboxes use about 160 MiB of pinned host RAM.
+GPU peer producer fusions, issue-ahead and coupled drafting are disabled in this
+mode. A fixed `--fn-mtp 2` enables the slower host-interleaved draft chain for
+comparison. The default `--fn-ar gp` continues to use peer VRAM.
+
+For reference-logit comparisons, run the offline two-worker `saber engine`
+harness with `--prompt-ids DIR --fn-conc 1 --fn-repeat 1 --fn-decode 0
+--fn-prefill-logits-dir OUT`. Each `DIR/<id>/meta.json` supplies a
+`token_ids` array. The leader writes `OUT/<id>.f32`, one little-endian FP32
+row over the full vocabulary after the last input token. Timing runs can
+omit this option to avoid the extra GPU readback.
+
 | Flag | What it does |
 |---|---|
 | `--no-build` | Reuse the last release build, as above. |

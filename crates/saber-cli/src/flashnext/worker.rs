@@ -1621,7 +1621,12 @@ fn run_rank(
         );
     }
     let lc = LoadCounters::new();
-    let ps = PluginSet::load_named(hip, prebuilt, &PLUGINS, &lc)?;
+    let host_ar = f.fn_ar == "host";
+    let plugins: Vec<_> = PLUGINS
+        .into_iter()
+        .chain(host_ar.then_some("flashnext_ar_host"))
+        .collect();
+    let ps = PluginSet::load_named(hip, prebuilt, &plugins, &lc)?;
     let table = ps.functions(hip)?;
     // FN51: the table covers the pools' context (byte-identical rows below 65,536)
     let cs = rope_table(super::run::rope_pos(super::run::pools_ctx(f, prompts)));
@@ -1686,25 +1691,30 @@ fn run_rank(
     } else {
         ArRules::prod()?
     };
-    let ar_mb = super::dev::ar_mb(f.max_chunk());
-    let mine = dev.ar_alloc(&arules, ar_mb)?;
-    // the reduce's peer-visible regions cross as IPC handles (the 27B's form)
-    let (hs, hf) = {
-        let a = dev.ar.as_ref().context("ar")?;
-        (hip.ipc_export(&a.0)?, hip.ipc_export(&a.1)?)
+    let ar_mb = if host_ar {
+        super::host_ar::slot_bytes(f.max_chunk())
+    } else {
+        super::dev::ar_mb(f.max_chunk())
     };
-    let ps_ = hip.ipc_import(peer.swap_handle("fn.ar.scratch", hs)?)?;
-    let pf_ = hip.ipc_import(peer.swap_handle("fn.ar.flags", hf)?)?;
-    let theirs = ArState {
-        scratch: ps_.as_u64(),
-        flags: pf_.as_u64(),
-        seq: 0,
-        loc: 0,
+    let host_regions;
+    let (mine, theirs) = if host_ar {
+        host_regions = super::host_ar::HostAr::open(hip, &dev.stream, &peer, ar_mb)?;
+        println!("fnar host rank{rank}: {ar_mb} bytes per parity slot, {} blocks, system-scope registered host transport", super::host_ar::BLOCKS);
+        host_regions.states()
+    } else {
+        let mine = dev.ar_alloc(&arules, ar_mb)?;
+        let a = dev.ar.as_ref().context("ar")?;
+        let hs = hip.ipc_export(&a.0)?;
+        let hf = hip.ipc_export(&a.1)?;
+        let ps = hip.ipc_import(peer.swap_handle("fn.ar.scratch", hs)?)?;
+        let pf = hip.ipc_import(peer.swap_handle("fn.ar.flags", hf)?)?;
+        (mine, ArState { scratch: ps.as_u64(), flags: pf.as_u64(), seq: 0, loc: 0 })
     };
     let mut st = [ArState::default(); 2];
     st[ri] = mine;
     st[1 - ri] = theirs;
     let pair = ArPair {
+        host: host_ar,
         rules: arules,
         st,
         mb: ar_mb,
@@ -3344,6 +3354,15 @@ fn run_rank(
                         Some(&ref_req(Some(p), 0)),
                     )?;
                     lv.next = pick.0[0];
+                    if let Some(dir) = &f.fn_prefill_logits_dir {
+                        let address = rk.last_lg;
+                        let (_, _, logits) = self::pick(&mut rk, address, 1, true)?;
+                        if rank == 0 {
+                            ensure!(logits.len() == VOCAB as usize, "incomplete next-token logit row");
+                            let bytes: Vec<u8> = logits.iter().flat_map(|x| x.to_le_bytes()).collect();
+                            std::fs::write(dir.join(format!("{}.f32", p.id)), bytes)?;
+                        }
+                    }
                     firsts.push(pick.0[0]);
                     // FN80b-2: the mirrored placement after every prompt (a divergence = FATAL)
                     if f.experts_tp2() {

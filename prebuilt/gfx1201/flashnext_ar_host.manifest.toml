@@ -1,0 +1,87 @@
+schema_version = 1
+plugin = "flashnext_ar_host"
+arch = "gfx1201"
+source = "crates/saber-kernels/hip/flashnext_ar_host.hip"
+source_sha256 = "5875e820e047e5d0cd68ee2f85ddaeaa0882a6e5cb53b1141ea06c8f8f921828"
+flags = "--genco --offload-arch=gfx1201 -O3 -ffp-contract=off"
+build_hash = "3059e04109c4fdec4c9ccc914a0ae913ec1483e21cf3cc37086aab10dd4161a0"
+hsaco = "flashnext_ar_host.hsaco"
+hsaco_sha256 = "afdc9db590bceb34dc1e99685e12b39ebc9fedc33dc8a39ec1935fac821fd78d"
+
+[[kernel]]
+name = "fn_ar_host_exact_bf16"
+symbol = "fn_ar_host_exact_bf16.kd"
+kernarg_segment_size = 328
+kernarg_segment_align = 8
+group_segment_fixed_size = 4
+private_segment_fixed_size = 0
+vgpr_count = 75
+sgpr_count = 46
+wavefront_size = 32
+max_flat_workgroup_size = 1024
+
+[[kernel.arg]]
+offset = 0
+size = 8
+value_kind = "global_buffer"
+name = "in"
+
+[[kernel.arg]]
+offset = 8
+size = 8
+value_kind = "global_buffer"
+name = "peer_scratch"
+
+[[kernel.arg]]
+offset = 16
+size = 8
+value_kind = "global_buffer"
+name = "my_scratch"
+
+[[kernel.arg]]
+offset = 24
+size = 8
+value_kind = "global_buffer"
+name = "out"
+
+[[kernel.arg]]
+offset = 32
+size = 8
+value_kind = "global_buffer"
+name = "peer_flags"
+
+[[kernel.arg]]
+offset = 40
+size = 8
+value_kind = "global_buffer"
+name = "my_flags"
+
+[[kernel.arg]]
+offset = 48
+size = 8
+value_kind = "global_buffer"
+name = "seq_ctrs"
+
+[[kernel.arg]]
+offset = 56
+size = 4
+value_kind = "by_value"
+name = "n16"
+
+[[kernel.arg]]
+offset = 60
+size = 4
+value_kind = "by_value"
+name = "slot_stride16"
+
+[[kernel.arg]]
+offset = 64
+size = 4
+value_kind = "by_value"
+name = "drain"
+
+[[kernel.arg]]
+offset = 68
+size = 4
+value_kind = "by_value"
+name = "acq"

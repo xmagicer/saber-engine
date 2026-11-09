@@ -246,6 +246,8 @@ pub struct ArState {
 
 /// The two-rank reduce as emission (host only: every address is already known).
 pub struct ArPair {
+    /// All stand-alone reductions use the bounded exact registered-host kernel.
+    pub host: bool,
     pub rules: ArRules,
     pub st: [ArState; 2],
     /// FN38: the mailbox size both ranks allocated ([`ar_mb`]).
@@ -391,7 +393,12 @@ impl Reduce for ArPair {
             if !lossy {
                 let n16 = nbytes / 16;
                 let nb = a.min_nb.max(a.max_nb_exact.min(n16 / a.words_per_block));
-                let nb = nb.min(n16).max(1).min(a.max_blocks);
+                let nb = if self.host {
+                    anyhow::ensure!(nbytes <= mb && n_elem % 8 == 0, "host BF16 reduce does not fit its mailbox");
+                    super::host_ar::BLOCKS
+                } else {
+                    nb.min(n16).max(1).min(a.max_blocks)
+                };
                 if self.ll {
                     anyhow::ensure!(
                         nbytes <= LL_PAYLOAD && nb <= LL_MAX_BLOCKS,
@@ -421,7 +428,9 @@ impl Reduce for ArPair {
                     continue;
                 }
                 // FN114d: the gp twin takes the same arguments with its own flag / counter words
-                let (sym, w0) = if self.gp {
+                let (sym, w0) = if self.host {
+                    (super::host_ar::SYMBOL, 0)
+                } else if self.gp {
                     anyhow::ensure!(nb <= GP_NC, "--fn-ar gp: an exact reduce on {nb} blocks");
                     (GP_EXACT_SYMBOL, GP_WORD0 * 4)
                 } else {
@@ -511,7 +520,7 @@ impl Reduce for ArPair {
     }
 
     fn far_channel(&mut self, ems: &[Emitter<'_>], n_elem: u64) -> Option<Vec<FarChan>> {
-        if !self.far {
+        if self.host || !self.far {
             return None;
         }
         // the kernel exchanges FAR_SLICES combine slices of 128 columns (its flag words)
@@ -561,7 +570,7 @@ impl Reduce for ArPair {
     }
 
     fn mix_channel(&mut self, ems: &[Emitter<'_>], n_elem: u64) -> Option<Vec<FarChan>> {
-        if self.mix == MixPush::Off {
+        if self.host || self.mix == MixPush::Off {
             return None;
         }
         // the kernel exchanges MIX_WGS workgroups of 64 columns (its flag / counter words)
@@ -608,7 +617,7 @@ impl Reduce for ArPair {
 
     fn rp_channel(&mut self, ems: &[Emitter<'_>], n_elem: u64) -> Option<Vec<RpChan>> {
         let a = self.rules;
-        if self.lossy(ems, n_elem)
+        if self.host || self.lossy(ems, n_elem)
             || n_elem % H != 0
             || n_elem / H > super::exec::DECODE_RP_MAX_ROWS
             || rp_scratch_off(self.mb) + n_elem * 2 > self.mb
@@ -651,7 +660,7 @@ impl Reduce for ArPair {
         let nbytes = n_elem * 2;
         let m = n_elem / H;
         let on = ems.iter().all(|e| e.rules.hc.rr_producer);
-        if !on || self.lossy(ems, n_elem) || n_elem % H != 0 || m > HCRR_MAX_ROWS {
+        if self.host || !on || self.lossy(ems, n_elem) || n_elem % H != 0 || m > HCRR_MAX_ROWS {
             let outs = self.reduce(ems, ins, n_elem, carry)?;
             let n = outs.len();
             return Ok((outs, vec![None; n]));
@@ -709,6 +718,7 @@ impl Reduce for ArPair {
 /// A host-only reduce for sizing and launch-count tests (same allocations, same launches).
 pub fn fake_pair() -> anyhow::Result<ArPair> {
     Ok(ArPair {
+        host: false,
         rules: ArRules::prod()?,
         st: [ArState::default(); 2],
         mb: AR_MB,
