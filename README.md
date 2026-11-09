@@ -257,6 +257,12 @@ harness with `--prompt-ids DIR --fn-conc 1 --fn-repeat 1 --fn-decode 0
 row over the full vocabulary after the last input token. Timing runs can
 omit this option to avoid the extra GPU readback.
 
+The offline single-request greedy harness also accepts a Flash-Next
+DFlash2 drafter over a local socket. Saber captures five target layers,
+verifies every proposed token and records the accepted prefix and commit
+time for each round. The Python reference service, pinned weights and
+matched-control command are in the [DFlash2 experiment guide](tools/flashnext_dflash2/README.md).
+
 | Flag | What it does |
 |---|---|
 | `--no-build` | Reuse the last release build, as above. |

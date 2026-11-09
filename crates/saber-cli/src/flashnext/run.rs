@@ -664,6 +664,12 @@ pub struct FnFlags {
     /// little-endian FP32 (`<prompt-id>.f32`) for comparison with a reference model.
     #[arg(long)]
     pub fn_prefill_logits_dir: Option<PathBuf>,
+    /// Offline single-request DFlash2 draft service for Flash-Next. The target verifies every token.
+    #[arg(long)]
+    pub fn_dflash2_socket: Option<PathBuf>,
+    /// Number of DFlash2 candidates per target verify (1..4, default 4).
+    #[arg(long, requires = "fn_dflash2_socket", value_parser = clap::value_parser!(u32).range(1..=4))]
+    pub fn_dflash2_k: Option<u32>,
     /// Flash-Next (FN14): the pairing CONTROL -- run every decode step EAGERLY (FN13's form). The
     /// default replays one hipGraph per (decode bucket 1/2/4/8, PLE parity), captured on first use.
     #[arg(long)]
@@ -3311,6 +3317,7 @@ impl FnFlags {
             && self.fn_long.is_empty()
             && !self.fn_dump
             && self.fn_prefill_logits_dir.is_none()
+            && self.fn_dflash2_socket.is_none()
             && !self.no_fn_capture
             && !self.fn_capture_verify
             && self.fn_poison_step.is_none()
@@ -3662,6 +3669,16 @@ pub fn main(
         println!("fnar host: registered host pages, exact BF16; MTP {:?}, host pick exchange and draft chain, device-step and peer producer fusions off", f.fn_mtp_arg.unwrap_or(FnMtp::Off));
     }
     let f = &f.resolved();
+    if f.fn_dflash2_socket.is_some() {
+        ensure!(
+            tp == 2 && f.fn_ar == "host" && !f.fn_one_process && !f.scripted()
+                && f.fn_serve.is_none() && f.fn_conc == [1] && f.fn_sched == "groups"
+                && f.fn_turns == 1 && f.fn_decode > 1 && !f.fn_preflight
+                && (f.no_fn_capture || (f.graph_split()? == GraphSplit::Layer && !f.fn_capture_verify))
+                && f.fn_mtp == FnMtp::Off && f.fn_mtp_ref.is_none() && !f.fn_mtp_no_rollback,
+            "--fn-dflash2-socket requires the offline single-turn greedy harness: --tp 2 --fn-ar host --fn-mtp 0 --fn-conc 1 --fn-decode N (N >= 2) and --no-fn-capture or --fn-graph-split layer"
+        );
+    }
     let ckpt = manifest_ckpt(pack)?;
     let cfg = Qwen4ExpConfig::from_config_json(&std::fs::read_to_string(ckpt.join("config.json"))?)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -5895,6 +5912,12 @@ pub fn plan_boot_at(
             });
             c
         };
+        if f.fn_dflash2_socket.is_some() {
+            classes.push(saber_mem::flashnext_budget::Class {
+                name: "fn.dflash2.taps".into(),
+                bytes: super::worker::dflash2_tap_bytes(f, prompts),
+            });
+        }
         // FN55b: the tower (its weight window + its arena) is billed BEFORE the expert slots are
         // sized (the slots are the remainder); a text-only boot's ledger is unchanged
         // FN55c: under `lazy` the class is the REGION the tower will be uploaded into (the

@@ -414,7 +414,7 @@ pub(super) fn decode_mtp(
             })
             .collect();
         let pos0: Vec<u32> = lives.iter().map(|l| l.len).collect();
-        let (outs, stat) = decode_step(
+        let (outs, mut stat) = decode_step(
             rk, em, ple, ph, recs, lives, bucket, *dp, gr, f, &reqs, w, &drafts,
         )?;
         *dp = 1 - *dp;
@@ -457,6 +457,7 @@ pub(super) fn decode_mtp(
             acc.push(a);
             ams.push(am);
         }
+        stat.committed_at = Some(Instant::now());
         if let Some(c) = ctl.as_mut() {
             c.time_verify(w, ti.elapsed().as_secs_f64() * 1e3);
             let mine = if rk.rank == 0 {
