@@ -112,9 +112,10 @@ code/prose, concurrency 2/4/8, and roughly 16K/64K/128K prompts. It requests exa
 1,024 output tokens for short workloads and 512 for long ones with thinking off,
 temperature zero and `ignore_eos`. Persisted SSE and usage distinguish tokens from
 chunks. Decode rate is approximate (usage tokens divided by first-to-last text
-chunk time); concurrent throughput includes end-to-end latency. Report medians
-across the three batches and actual token counts. Also test retrieval near the
+chunk time); concurrent throughput includes end-to-end latency. Report the arithmetic mean, median and highest complete-request decode rate across the three repeats of each workload, alongside actual token counts. Also test retrieval near the
 advertised context limit separately; startup alone does not verify that limit.
+
+For a within-request peak, run both arms with `--stream-timing`. The client adds `return_token_ids: true` to the transmitted payload and records its SHA-256 alongside the saved payload hash. It counts generated token IDs as SSE frames arrive and reports the busiest complete one-second window in tok/s. The per-request timing record lists its frame counts and the window boundaries. Missing step IDs, mismatched final usage, or less than one second of ID arrivals leave this peak unavailable. To recover whole-request statistics from an existing run, use `--summarize-existing RESULT_DIR --payload-dir PAYLOAD_DIR`.
 
 The old Quark MXFP4 checkpoint and Saber NVFP4-to-MXFP4 packs have different
 quantization pipelines. These are deployment comparisons, not an isolated measure

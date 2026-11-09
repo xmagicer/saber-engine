@@ -38,7 +38,7 @@ def classify(names, i):
 def ms_summary(values):
     ms = sorted(x / 1e6 for x in values)
     return {"mean_ms": statistics.mean(ms), "median_ms": statistics.median(ms),
-            "p95_ms": ms[math.ceil(len(ms) * .95) - 1]}
+            "p95_ms": ms[math.ceil(len(ms) * .95) - 1], "max_ms": ms[-1]}
 
 
 def analyze(rows):
