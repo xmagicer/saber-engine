@@ -126,12 +126,14 @@ tools, streaming, thinking and multi-turn tests passed. Cancellation drained in
 and reload took 14.55 s; the original 7200-second policy was restored. Observed
 container shutdowns exited successfully. No kernel or boot configuration changed.
 
-`--engine-spec-tree best16` exposes the existing 16-row ancestor verifier. It
-currently requires `--engine-max-seqs 1`; the 16-row chain-after-tree flush is
-not implemented. Its state advance uses the matching 16-row record layout and
-must not run through the 10-row batched advance kernel. It passed checked model
-trials, but its extra verification cost offset most acceptance gains. It is not
-the default. The ordinary 16-query attention guard remains unchanged.
+`--engine-spec-tree best16` enables the 16-row ancestor verifier for one active
+sequence. Its state advance uses the 16-row record layout. The target can also
+plan a six-wave uniform causal kernel at exactly 16 queries for GQA 6, head size
+256 and a 16-token page. Chain and tree captures have separate identities on
+both TP ranks. Worker wire version 17 requires matched binaries.
 
-DSpine utilities are documented [separately](../tools/dspine/README.md). They
-are acceptance and numerical experiments, not a DSpine serving backend.
+The experimental DSpine socket backend consumes verified target features and
+returns chain or 15-node proposals. In the tested matched-Quark configuration
+the optimized tree measured 203.91 tok/s for code and 137.57 tok/s for prose.
+The standard NVFP4 + DFlash2 hybrid remains the deployed configuration.
+[See the DSpine launch procedure and feature limits](../tools/dspine/README.md).

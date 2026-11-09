@@ -18,6 +18,12 @@
 #   MAX_CTX=131072 beside the width-8 verify arenas).
 #   KV (P27-6, default since 2026-10-05): the drafter's KV is paged by admission -> at 262,144 the pool is
 #   47,335 blocks = 757,360 tokens a rank (2 x 262k sessions); `--engine-draft-kv dense` = the control (21,169 = 338,704).
+#   DSpine experiment: BATCHES=1 MAX_SEQS=1 WIDTHS=1,16 tools/serve_27b.sh --tp 2
+#     --engine-dspine-socket /shared/dspine.sock --engine-spec-tree best16 --enable-prefix-caching off
+#   Pass these arguments in one command. Start the sidecar separately with its socket in a mounted
+#   directory. The target profile requires both park tiers at zero. The sidecar loses its teacher
+#   context on disconnect; an idle unload/reload manager must own both process lifetimes.
+#   Use --engine-spec-tree off for ordinary chains (widths 1,8 or 1,16).
 #   LEDGER (P27-7, default since 2026-10-07): `--engine-ledger lean` replaces --engine-budget-mib / headroom with
 #   31,824 / 848 MiB -> 51,906 blocks = 830,496 tokens a rank (3 x 262k); `--engine-ledger today` = the control.
 #
@@ -114,8 +120,13 @@ fi
 # launcher reports ready only after the server's `warmprompts done` line.
 ARGS=()
 WARM=""
+DSPINE_PATH=""
 while [ $# -gt 0 ]; do
   case "$1" in
+    --engine-dspine-socket)
+      [ -n "${2:-}" ] || { echo "--engine-dspine-socket requires a path" >&2; exit 2; }
+      DSPINE_PATH=$2; shift 2 ;;
+    --engine-dspine-socket=*) DSPINE_PATH=${1#*=}; [ -n "$DSPINE_PATH" ] || exit 2; shift ;;
     --warm-prompts) WARM=${2:-}; shift; [ $# -gt 0 ] && shift ;;
     --warm-prompts=*) WARM=${1#*=}; shift ;;
     *) ARGS+=("$1"); shift ;;
@@ -158,9 +169,19 @@ if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ":$PORT\$"; then echo "port
 for f in "$REPO/.cache/template_corpus.tokenizer.json" "$REPO/.cache/template_corpus.jinja"; do
   [ -f "$f" ] || { echo "missing $f (the 27B serve plane's tokenizer / chat template; run tools/fetch_packs.sh $FETCH)" >&2; exit 1; }
 done
-[ -d "$PACKS/$TIER" ] && [ -d "$PACKS/$DRAFT" ] || { echo "missing pack $PACKS/$TIER or $PACKS/$DRAFT (run tools/fetch_packs.sh $FETCH)" >&2; exit 1; }
+required_packs=("$PACKS/$TIER")
+if [ -n "$DSPINE_PATH" ]; then
+  printf -v draft_args '%s %q' '--engine-dspine-socket' "$DSPINE_PATH"
+else
+  required_packs+=("$PACKS/$DRAFT")
+  printf -v draft_args '%s %q %s %q' '--engine-draft-block' "${DRAFT_BLOCK:-8}" '--engine-draft-pack' "/packs/$DRAFT"
+fi
+for pack_dir in "${required_packs[@]}"; do
+  [ -d "$pack_dir" ] || { echo "missing pack $pack_dir (run tools/fetch_packs.sh $FETCH)" >&2; exit 1; }
+done
 if [ "$TP" = 1 ]; then
-  for f in "$PACKS/$TIER/rank0.pack" "$PACKS/$DRAFT/rank0.pack"; do
+  for pack_dir in "${required_packs[@]}"; do
+    f="$pack_dir/rank0.pack"
     [ -f "$f" ] || { echo "missing $f (TP=1 needs the single-card packs: run tools/fetch_packs.sh 27b-tp1)" >&2; exit 1; }
   done
   [ ! -e "$PACKS/$TIER/rank1.pack" ] || { echo "$PACKS/$TIER is a TP=2 pack (it has rank1.pack); TP=1 needs the -tp1 packs from tools/fetch_packs.sh 27b-tp1" >&2; exit 1; }
@@ -180,7 +201,7 @@ SERVE_CMD="$SABER serve --engine real $TP_ARGS \
   --hip-lib /opt/rocm/lib/libamdhip64.so.7 --pack /packs/$TIER --prebuilt ${PREBUILT:-prebuilt/gfx1201} \
   --tokenizer /work/.cache/template_corpus.tokenizer.json --chat-template /work/.cache/template_corpus.jinja \
   --engine-max-ctx $MAX_CTX --engine-prefill-rows 96,128,192,256,320,384,512,768,1024,1536,2048 \
-  --engine-decode-batches $BATCHES --engine-decode-widths ${WIDTHS:-1,8} --engine-max-seqs $MAX_SEQS --engine-draft-block ${DRAFT_BLOCK:-8} --engine-draft-pack /packs/$DRAFT \
+  --engine-decode-batches $BATCHES --engine-decode-widths ${WIDTHS:-1,8} --engine-max-seqs $MAX_SEQS $draft_args \
   --engine-budget-mib ${BUDGET_MIB:-30500} --engine-rectangular-widths --served-model-name $MODEL --host $HOST --port $PORT ${COLLECTIVE_ARGS[*]} ${ARGS[*]}"
 # FN73: a server that exits is reported with ITS exit code (86 = a rank failed: the log's last
 # line is `saber: FATAL rank R: <reason>`), and this script exits with it -- never a masked 1.

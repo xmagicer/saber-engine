@@ -112,13 +112,9 @@ class TorchDspine:
             raise ValueError('Teacher context positions must be contiguous from zero')
         if aux.device!=self.device or positions.device!=self.device:
             raise ValueError('Context and weights must share a device')
-        projected=rms_norm(self.linear(aux,self.w['fc.weight']),self.w['hidden_norm.weight'],self.eps)
+        keys,values=self.project_context(aux,positions)
         new_keys=[];new_values=[]
-        for layer in range(self.layers):
-            prefix=f'layers.{layer}.self_attn.'
-            key=self.linear(projected,self.w[prefix+'k_proj.weight']).reshape(-1,self.kheads,self.dim)
-            key=self.rope(self.per_head_norm(key,self.w[prefix+'k_norm.weight']),positions)
-            value=self.linear(projected,self.w[prefix+'v_proj.weight']).reshape(-1,self.kheads,self.dim)
+        for layer,(key,value) in enumerate(zip(keys,values)):
             if entry is not None:
                 key=torch.cat((entry['keys'][layer],key),0)
                 value=torch.cat((entry['values'][layer],value),0)
@@ -127,6 +123,34 @@ class TorchDspine:
         pos=positions if entry is None else torch.cat((entry['positions'],positions))
         self.cache[seq]={'next':next_position+aux.shape[0],'positions':pos[-self.window:].contiguous(),
                          'keys':new_keys,'values':new_values}
+
+    @torch.no_grad()
+    def project_context(self,aux,positions):
+        """Project committed teacher rows once, at their absolute positions."""
+        projected=rms_norm(self.linear(aux,self.w['fc.weight']),self.w['hidden_norm.weight'],self.eps)
+        keys=[];values=[]
+        for layer in range(self.layers):
+            prefix=f'layers.{layer}.self_attn.'
+            key,value=self.project_kv(projected,prefix)
+            key=key.reshape(-1,self.kheads,self.dim)
+            key=self.rope(self.per_head_norm(key,self.w[prefix+'k_norm.weight']),positions)
+            value=value.reshape(-1,self.kheads,self.dim)
+            keys.append(key)
+            values.append(value)
+        return keys,values
+
+    def project_kv(self,hidden,attn):
+        return (self.linear(hidden,self.w[attn+'k_proj.weight']),
+                self.linear(hidden,self.w[attn+'v_proj.weight']))
+
+    def project_qkv(self,hidden,attn):
+        query=self.linear(hidden,self.w[attn+'q_proj.weight'])
+        key,value=self.project_kv(hidden,attn)
+        return query,key,value
+
+    def project_gate_up(self,hidden,prefix):
+        return (self.linear(hidden,self.w[prefix+'mlp.gate_proj.weight']),
+                self.linear(hidden,self.w[prefix+'mlp.up_proj.weight']))
 
     @torch.no_grad()
     def forward_block(self,seq,input_embeds,input_ids,positions):
@@ -158,9 +182,10 @@ class TorchDspine:
         stash=None
         for layer in range(self.layers):
             prefix=f'layers.{layer}.';attn=prefix+'self_attn.'
-            query=self.linear(hidden,self.w[attn+'q_proj.weight']).reshape(t,self.qheads,self.dim)
-            key=self.linear(hidden,self.w[attn+'k_proj.weight']).reshape(t,self.kheads,self.dim)
-            value=self.linear(hidden,self.w[attn+'v_proj.weight']).reshape(t,self.kheads,self.dim)
+            query,key,value=self.project_qkv(hidden,attn)
+            query=query.reshape(t,self.qheads,self.dim)
+            key=key.reshape(t,self.kheads,self.dim)
+            value=value.reshape(t,self.kheads,self.dim)
             query=self.rope(self.per_head_norm(query,self.w[attn+'q_norm.weight']),positions)
             key=self.rope(self.per_head_norm(key,self.w[attn+'k_norm.weight']),positions)
             if entry is not None:
@@ -173,8 +198,7 @@ class TorchDspine:
             attended=attended[0].transpose(0,1).reshape(t,self.qheads*self.dim).contiguous()
             projected=self.linear(attended,self.w[attn+'o_proj.weight'])
             mlp_input,residual=add_rms_norm(projected,residual,self.w[prefix+'post_attention_layernorm.weight'],self.eps)
-            gate=self.linear(mlp_input,self.w[prefix+'mlp.gate_proj.weight'])
-            up=self.linear(mlp_input,self.w[prefix+'mlp.up_proj.weight'])
+            gate,up=self.project_gate_up(mlp_input,prefix)
             glu=(torch.nn.functional.silu(gate.float())*up.float()).to(torch.bfloat16)
             mlp=self.linear(glu,self.w[prefix+'mlp.down_proj.weight'])
             read=self.w['selected_prefix_bridge.read_weight'] if layer==self.layers-1 else self.w['selected_prefix_bridge.early_read_weights'][layer]

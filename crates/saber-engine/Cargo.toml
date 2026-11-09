@@ -20,6 +20,7 @@ saber-serve = { path = "../saber-serve" }
 # No `anyhow`: every error this crate produces is a `ForwardError` the step loop has to match on.
 thiserror = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]

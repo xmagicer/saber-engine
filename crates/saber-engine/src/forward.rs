@@ -144,10 +144,15 @@ pub struct StepRows {
     /// `cu`, the ragged attention, another GDN route). Every map keyed on `StepRows` — the declared
     /// budgets, the captured graphs, the per-shape facts — keys on it.
     pub ragged: bool,
+    /// The ancestor-mask verifier has different kernels from a rectangular chain of the same size.
+    pub tree: bool,
 }
 
 impl std::fmt::Display for StepRows {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.tree {
+            return write!(f, "{} tree ({} rows)", self.phase, self.rows);
+        }
         if self.ragged {
             return write!(
                 f,
@@ -1527,6 +1532,7 @@ mod tests {
             rows: batch * width,
             width,
             samples: true,
+            tree: false,
             ragged: false,
         }
     }
@@ -1603,6 +1609,7 @@ mod bucket_facts {
             rows,
             width,
             samples: true,
+            tree: false,
             ragged: false,
         }
     }

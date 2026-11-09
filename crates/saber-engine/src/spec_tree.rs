@@ -119,6 +119,10 @@ impl SpecTree {
     /// # Errors
     /// [`TreeError::Malformed`] when a parent does not precede its child or depths do not chain.
     pub fn new(nodes: Vec<Node>) -> Result<SpecTree, TreeError> {
+        Self::new_limited(nodes, DRAFT_POSITIONS)
+    }
+
+    fn new_limited(nodes: Vec<Node>, max_depth: u32) -> Result<SpecTree, TreeError> {
         for (i, n) in nodes.iter().enumerate() {
             let want = match n.parent {
                 None => 1,
@@ -129,7 +133,7 @@ impl SpecTree {
                     )))
                 }
             };
-            if n.depth != want || n.depth > DRAFT_POSITIONS {
+            if n.depth != want || n.depth > max_depth {
                 return Err(TreeError::Malformed(format!(
                     "node {i} at depth {} under a parent that puts it at {want}",
                     n.depth
@@ -610,6 +614,50 @@ impl TreePlan {
             parent_row,
             depth,
             tokens,
+        })
+    }
+
+    /// Build the external 15-node verifier layout from token IDs and zero-based parent indices.
+    /// Each sibling token must be unique so both TP ranks derive the same accepted path.
+    pub(crate) fn from_external(
+        anchor: u32,
+        entries: &[(Option<usize>, u32)],
+        vocab: u32,
+    ) -> Result<Self, TreeError> {
+        if entries.len() != TREE_MAX_ROWS as usize - 1 || anchor >= vocab {
+            return Err(TreeError::Malformed(
+                "invalid external tree size or anchor".into(),
+            ));
+        }
+        let mut nodes: Vec<Node> = Vec::with_capacity(entries.len());
+        let mut siblings = std::collections::BTreeSet::new();
+        for (parent, token) in entries.iter().copied() {
+            if token >= vocab || !siblings.insert((parent, token)) {
+                return Err(TreeError::Malformed(
+                    "invalid external token or duplicate sibling".into(),
+                ));
+            }
+            let depth = match parent {
+                None => 1,
+                Some(parent) => {
+                    nodes
+                        .get(parent)
+                        .ok_or_else(|| {
+                            TreeError::Malformed("external parent must precede its child".into())
+                        })?
+                        .depth
+                        + 1
+                }
+            };
+            nodes.push(Node {
+                parent,
+                depth,
+                cand: nodes.len() as u32,
+            });
+        }
+        let tree = SpecTree::new_limited(nodes, TREE_MAX_ROWS - 1)?;
+        Self::new(tree, i64::from(anchor), |node| {
+            i64::from(entries[node.cand as usize].1)
         })
     }
 

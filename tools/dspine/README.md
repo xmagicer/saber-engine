@@ -1,6 +1,6 @@
 # DSpine validation tools
 
-These are experimental numerical, pack-reading and offline replay utilities. They do not select a DSpine serving backend.
+This directory includes numerical reference tools and an experimental DSpine serving backend for the 27B target. The following capture and replay sections describe the offline tools. The final section gives the live TP=2 launch procedure.
 
 - `reference.py` implements the four selected-prefix bridge operations and greedy serial refinement in PyTorch.
 - `plain_model.py` loads the five-layer BF16 DSpine checkpoint, keeps only the trained 8192-token teacher window, and never persists speculative query KV. Ordinary backbone norms follow SGLang's default single final BF16 cast and FP32 residual sum; the bridge retains its separately verified two-round BF16 next-norm contract.
@@ -28,7 +28,7 @@ The checkpoint's `[1,16,31,46,61]` are **zero-based decoder output** ids. Saber'
 
 Verified on a real gfx1201 GPU: upstream Triton bridge parity with the BF16 checkpoint, and no-future-feature replay against captured target outputs. Historical eager timing preceded the corrected layer and normalization checks and is superseded. Acceptance experiments and isolated proposal timing must not be presented as end-to-end serving throughput.
 
-Native group-128 W8A8 projections passed independent logical-matrix and varying-input graph checks. **Earlier acceptance measurements used the unshifted capture ids and are invalid as DSpine quality results.** The low-level numerical/causality checks remain useful, but acceptance must be remeasured with correctly captured decoder outputs. This work has not been adopted for serving.
+Native group-128 W8A8 projections passed independent logical-matrix and varying-input graph checks. **Earlier acceptance measurements used the unshifted capture ids and are invalid as DSpine quality results.** The corrected replay values below use the shifted capture points. The live backend uses channel FP8 projections.
 
 The channel-FP8 W8A16 variant is a separate numerical experiment. Its isolated projections passed matrix and graph checks, but its actual model comparison between padded graphs and the unpadded eager reference exceeded the current absolute-error gate. That graph variant has not passed acceptance; do not enable it based on the isolated matrix checks.
 
@@ -44,7 +44,7 @@ With corrected layer mapping and SGLang backbone norm semantics, an offline refe
 
 Each cell is code / prose. Tree construction reads only proposer probabilities; canonical future tokens are supplied afterward to an independent acceptance walk. `tree_proposal.py` checks normalized conditional probabilities, parent-before-child rows and 16-bit ancestor masks. The optional full transition output in `reference.serial_table` is a slow correctness path, not a serving implementation.
 
-These corrected results are acceptance diagnostics, not three-prompt medians or live tok/s. TP=2 serving integration remains incomplete; corrected isolated proposer timing is described below.
+These corrected results measure acceptance on the two captured trajectories. The sections below cover isolated proposal timing and the live TP=2 experiment.
 
 
 ## Corrected GPU proposal experiments
@@ -108,3 +108,55 @@ unfused tree and fused tree), each covering the saved code and prose trajectory.
 The GPU tree results reproduced the CPU-reference means above, and bridge fusion
 retained those means in both target variants. This validates the offline path;
 it does not establish TP=2 serving performance or 300/200 tok/s.
+
+
+## Live TP=2 experiment on two GPUs
+
+Use an exclusive test window on the two cards. Keep the managed launcher and its
+known-good binary available for restoration. Start in the repository after the
+release build and pack verification described in the [host guide](../../docs/HOST-COLLECTIVES.zh-CN.md).
+Download the draft weights with `hf download tencent/Qwen3.8-27B-DSpine-b16 --revision ea909c0f5fab8865f9e14600334f55f7ce47308f --local-dir "$HOME/models/Qwen3.8-27B-DSpine-b16"`. The tested target control used the matched Quark core pack and its existing FP8
+head. The drafter checkpoint is `tencent/Qwen3.8-27B-DSpine-b16` at revision
+`ea909c0f5fab8865f9e14600334f55f7ce47308f`.
+
+```sh
+export SABER_CONTAINER=docker
+export SABER_IMAGE=stilldeadcode/vllm-radiance@sha256:45694209177a55a1ab3ba6702fe6e978b1b66a6e66ae3fc066f8d579f7bc4c25
+export SABER_PACKS="$HOME/models/saber-packs"
+export TIER=qwen38-27b-quark-matched-core-fp8head
+export SABER_SHARED="$HOME/.cache/dspine-test"
+mkdir -p -m 700 "$SABER_SHARED"
+export RCCL_LIB=/opt/rocm/lib/librccl.so GPU_MAX_HW_QUEUES=1
+
+docker run -d --rm --name dspine-draft --device /dev/kfd --device /dev/dri \
+  --user "$(id -u):$(id -g)" --group-add "$(stat -c %g /dev/kfd)" --ipc=host \
+  -e HOME=/tmp -e HIP_VISIBLE_DEVICES=0,1 -e GPU_MAX_HW_QUEUES=1 \
+  -e NCCL_P2P_DISABLE=1 -e NCCL_IB_DISABLE=1 -e TRITON_CACHE_DIR=/shared/triton-cache \
+  -v "$PWD:/work:ro" -w /work -v "$SABER_SHARED:/shared" \
+  -v "$SABER_PACKS:/packs:ro" -v "$HOME/models/Qwen3.8-27B-DSpine-b16:/checkpoint:ro" \
+  --entrypoint python3 "$SABER_IMAGE" -m torch.distributed.run --standalone --nproc-per-node=2 \
+  tools/dspine/tp_service.py --checkpoint /checkpoint --prebuilt /work/prebuilt/gfx1201 \
+  --target-pack "/packs/$TIER" --draft-pack /packs/qwen38-dflash2-drafter-fp8head \
+  --socket /shared/draft.sock --max-seqs 1 --graph --fused-projections --gpu-tree
+```
+
+Wait for the ready record in `docker logs dspine-draft`. Start the target with
+the socket's host path, which the target launcher mounts at the same absolute path.
+
+```sh
+HOST=127.0.0.1 PORT=18081 CNAME=dspine-target MODEL=qwen3.8-27b-mxfp4 \
+  MAX_CTX=262144 MAX_SEQS=1 BATCHES=1 WIDTHS=1,16 BUDGET_MIB=21504 \
+  tools/serve_27b.sh --tp 2 --no-build --engine-host-ar --engine-ledger today \
+  --enable-prefix-caching off --engine-gdn-replay off --engine-spec-tree best16 \
+  --engine-dspine-socket "$SABER_SHARED/draft.sock"
+curl -fsS http://127.0.0.1:18081/v1/models
+```
+
+The experimental socket path supports a single active sequence, with prefix
+caching, forking and session park disabled. It uses a private mode-0600 Unix
+socket, an 8192-token teacher KV window and a 262144-token target context limit.
+For the chain control, select `--engine-spec-tree off`. For the width-8 control,
+set `WIDTHS=1,8` and omit `--gpu-tree`. The JSON response and the shutdown tree
+counters together verify a live request and actual tree selection. Stop the
+experiment with `docker stop dspine-target dspine-draft` and restore the managed
+launcher before checking gateway health.

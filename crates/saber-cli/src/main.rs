@@ -2330,6 +2330,10 @@ enum Cmd {
         #[arg(long)]
         engine_draft_capture_dir: Option<PathBuf>,
 
+        /// Use an external DSpine proposer over a local Unix-domain socket.
+        #[arg(long)]
+        engine_dspine_socket: Option<PathBuf>,
+
         /// Independent capture layers in checkpoint order (five comma-separated ids).
         #[arg(long, value_delimiter = ',', requires = "engine_draft_capture_dir")]
         engine_draft_capture_layers: Vec<u32>,
@@ -3486,6 +3490,9 @@ enum Cmd {
         /// Independent auxiliary capture plane; rank zero owns the output directory.
         #[arg(long, value_delimiter = ',')]
         draft_capture_layers: Vec<u32>,
+        /// Mirror the leader's DSpine feature taps. Only rank zero opens the socket.
+        #[arg(long)]
+        dspine_socket: Option<PathBuf>,
     },
 
     /// The P0 autotune sweep: measure every untuned route and write the cache
@@ -4947,6 +4954,7 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
             engine_rccl_lib,
             engine_host_ar,
             engine_draft_capture_dir,
+            engine_dspine_socket,
             engine_draft_capture_layers,
             manifest,
             prebuilt,
@@ -4991,6 +4999,10 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
                     engine_gdn_state_dtype == "f16",
                     &engine_spec_tree,
                     &[
+                        (
+                            engine_dspine_socket.is_some() && engine_decode_widths.contains(&16),
+                            "DSpine width 16 (GDN replay holds at most 8 rows)",
+                        ),
                         (enable_prefix_caching == "on", "--enable-prefix-caching on"),
                         (park_ram_gib > 0.0 || park_nvme_gib > 0.0, "a park tier"),
                     ],
@@ -5009,6 +5021,15 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
                 }
                 if engine_spec_tree == "best16" && engine_max_seqs != 1 {
                     anyhow::bail!("--engine-spec-tree best16 currently requires --engine-max-seqs 1: its chain-after-tree flush is not implemented");
+                }
+                if engine_dspine_socket.is_some()
+                    && (enable_prefix_caching != "off"
+                        || park_ram_gib > 0.0
+                        || park_nvme_gib > 0.0
+                        || spec_lookup == "on"
+                        || propose_in_step)
+                {
+                    anyhow::bail!("DSpine socket needs --enable-prefix-caching off, disabled park tiers, after-commit proposals and no lookup drafter");
                 }
                 if engine_draft_capture_dir.is_some()
                     && (enable_prefix_caching != "off"
@@ -5061,6 +5082,7 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
                         hip_lib,
                         rccl_lib: engine_rccl_lib,
                         host_ar: engine_host_ar,
+                        dspine_socket: engine_dspine_socket,
                         draft_capture_dir: engine_draft_capture_dir,
                         draft_capture_layers: engine_draft_capture_layers,
                         device: engine_device,
@@ -5527,6 +5549,7 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
                     hip_lib,
                     rccl_lib: rccl_lib,
                     host_ar,
+                    dspine_socket: None,
                     draft_capture_dir: None,
                     draft_capture_layers: Vec::new(),
                     device,
@@ -5775,6 +5798,7 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
             rccl_lib,
             host_ar,
             draft_capture_layers,
+            dspine_socket,
         } => engine::worker(&engine::WorkerArgs {
             engine: engine::EngineArgs {
                 vision_max_patches,
@@ -5792,6 +5816,7 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
                 hip_lib,
                 rccl_lib: rccl_lib,
                 host_ar,
+                dspine_socket,
                 draft_capture_dir: None,
                 draft_capture_layers,
                 device,

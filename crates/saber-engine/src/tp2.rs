@@ -121,6 +121,7 @@ const MAGIC: u32 = 0x5342_5432;
 /// ONE forward at a prefill rung over the combined index blob that follows it; its sampling,
 /// seam and context-store frames follow in the leader's order (the chunk's head, the decode
 /// head, the chunk's store), and both halves' proposals are deferred `Propose`s.
+/// 17 adds bit 6 to select the tree graph independently of its ordinary chain twin.
 /// It is in EVERY frame and checked on every decode,
 /// because the failure it prevents is a follower reading the leader's step fields out of the wrong
 /// offsets and replaying a shape that looks legal — and both ranks being the same binary is a
@@ -130,7 +131,7 @@ const MAGIC: u32 = 0x5342_5432;
 /// ([`saber_exec::RankPeer::agree`], through [`crate::device`]'s startup handshake): a pair of
 /// mismatched binaries is then a message while both cards are still idle, rather than a refused
 /// frame with a graph already in flight on each of them.
-pub const VERSION: u32 = 16;
+pub const VERSION: u32 = 17;
 
 /// **C10: a packed step's word** ([`Command::Mixed::packed`]): `more` further chunks, and per
 /// chunk `k` (bit `k`) whether its head samples, its seam runs, and its seam carries penalties.
@@ -281,6 +282,8 @@ pub enum Command {
         /// The per-slot widths need no field of their own: they are the `cu` table the leader's
         /// index frame already carries, which is what every kernel on the follower reads.
         ragged: bool,
+        /// Select the ancestor graph when the ordinary chain uses the same (rows, width).
+        tree: bool,
     },
     /// **C9: one FUSED mixed step**: a prompt chunk of `chunk_live` rows (rows `0..chunk_live`)
     /// and a decode bucket of `decode_rows` rows at verify `width` (rows `chunk_live..`) as ONE
@@ -667,6 +670,7 @@ impl Command {
                 slot,
                 defer_proposals,
                 ragged,
+                tree,
             } => (
                 2,
                 match phase {
@@ -686,7 +690,8 @@ impl Command {
                     | (u32::from(seam) << 2)
                     | (u32::from(seam_penalties) << 3)
                     | (u32::from(defer_proposals) << 4)
-                    | (u32::from(ragged) << 5),
+                    | (u32::from(ragged) << 5)
+                    | (u32::from(tree) << 6),
                 slot,
             ),
             Command::Mixed {
@@ -884,6 +889,7 @@ impl Command {
                 seam_penalties: word(24) & 8 != 0,
                 defer_proposals: word(24) & 16 != 0,
                 ragged: word(24) & 32 != 0,
+                tree: word(24) & 64 != 0,
                 slot: word(36),
             },
             3 => Command::Stop,
@@ -2434,6 +2440,7 @@ mod tests {
             seam_penalties: false,
             defer_proposals: false,
             ragged: false,
+            tree: false,
             slot: 0,
         };
         // A decode step's frame: a handful of runs and eight ids, not the 4 KiB region.
@@ -2554,6 +2561,7 @@ mod tests {
             seam_penalties: false,
             defer_proposals: false,
             ragged: false,
+            tree: false,
             slot: 0,
         };
         let e = leader
@@ -2581,6 +2589,7 @@ mod tests {
                 seam_penalties: false,
                 defer_proposals: false,
                 ragged: false,
+                tree: false,
                 slot: 0,
             },
             // A prefill chunk, WITH its state slot: the field ws-h30 added is the one the
@@ -2596,6 +2605,7 @@ mod tests {
                 seam_penalties: false,
                 defer_proposals: false,
                 ragged: false,
+                tree: false,
                 slot: 6,
             },
             // EVERY flag bit at once: they share one word, so a decode that samples, crosses a
@@ -2612,6 +2622,7 @@ mod tests {
                 seam_penalties: true,
                 defer_proposals: false,
                 ragged: false,
+                tree: false,
                 slot: 0,
             },
             // THE DEFERRED PROPOSAL (ws-f37): the flag alone, so a mask that aliased it onto
@@ -2627,6 +2638,7 @@ mod tests {
                 seam_penalties: false,
                 defer_proposals: true,
                 ragged: false,
+                tree: false,
                 slot: 0,
             },
             Command::Propose {
@@ -2658,6 +2670,7 @@ mod tests {
                 seam_penalties: false,
                 defer_proposals: false,
                 ragged: false,
+                tree: false,
                 slot: 0,
             },
             // A DENSE ROW, the fallback behind the seam: the head named by shape, because rank 1
@@ -2728,10 +2741,34 @@ mod tests {
             seam_penalties: false,
             defer_proposals: true,
             ragged: true,
+            tree: false,
             slot: 0,
         };
         let h = band.encode(7);
         assert_eq!(Command::decode(&h, 7).expect("decode"), band);
+        // A rectangular 16-row chain and a best16 target tree must select different GPU graphs.
+        let mut chain = band;
+        if let Command::Step {
+            rows,
+            width,
+            live,
+            ragged,
+            tree,
+            ..
+        } = &mut chain
+        {
+            *rows = 16;
+            *width = 16;
+            *live = 16;
+            *ragged = false;
+            *tree = false;
+        }
+        let mut ancestor = chain;
+        if let Command::Step { tree, .. } = &mut ancestor {
+            *tree = true;
+        }
+        assert_ne!(chain.encode(7), ancestor.encode(7));
+        assert_eq!(Command::decode(&ancestor.encode(7), 7).unwrap(), ancestor);
         // The flag is ONE bit of the flag word, beside the others: clear it and every other field
         // survives while the step becomes the rectangle of the same (rows, width).
         let mut cleared = h;
@@ -2757,7 +2794,12 @@ mod tests {
         let mut old = h;
         old[32..36].copy_from_slice(&11u32.to_le_bytes());
         assert!(Command::decode(&old, 7).is_err(), "wire 11 must be refused");
-        assert_eq!(VERSION, 16);
+        old[32..36].copy_from_slice(&16u32.to_le_bytes());
+        assert!(
+            Command::decode(&old, 7).is_err(),
+            "a rank without a tree/chain discriminator must refuse this frame"
+        );
+        assert_eq!(VERSION, 17);
     }
 
     /// C10: a packed step's word round-trips K, the per-chunk sample / seam / penalty masks, and
