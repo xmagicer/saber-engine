@@ -270,6 +270,23 @@ pub mod prebuilt {
 
     /// Every committed plugin, with one kernel name per plugin used as a smoke sample in tests.
     pub const ALL: &[(&str, &str)] = &[
+        // Bounded exact shared-host transports; native P2P objects retain their own entries.
+        (
+            "saber_ar_host_exact.hsaco",
+            "saber_ar_oneshot_2rank_exact_bf16",
+        ),
+        (
+            "saber_ar_host_exact_chk.hsaco",
+            "saber_ar_oneshot_2rank_exact_bf16_chk",
+        ),
+        (
+            "mxfp4_gemm_decode_host_arnq.hsaco",
+            "mxfp4_gemm_decode_arnq_bk128_ks4_tm1_wperm1_nt1",
+        ),
+        (
+            "mxfp4_gemm_decode_host_arnq_chk.hsaco",
+            "mxfp4_gemm_decode_arnq_bk128_ks4_tm1_wperm1_nt1_chk",
+        ),
         (
             "mxfp4_gemm_decode.hsaco",
             "mxfp4_gemm_decode_bk128_ks4_tm1_wperm1_nt1",

@@ -1,0 +1,603 @@
+schema_version = 1
+plugin = "mxfp4_gemm_decode_host_arnq_chk"
+arch = "gfx1201"
+source = "crates/saber-kernels/hip/mxfp4_gemm_decode_host_arnq_chk.hip"
+source_sha256 = "44b72cc23f5a7100cb946cf84c8ba9e9d53448561dc0808008eb18716bcc4991"
+flags = "--genco --offload-arch=gfx1201 -O3"
+build_hash = "c37b5d30da47b241aca6915054f4c0daa49e80ae8402031007b225b199e28d96"
+hsaco = "mxfp4_gemm_decode_host_arnq_chk.hsaco"
+hsaco_sha256 = "f6d4aa36801f82b2303b078b07e56eaab541ea7f62c9485e088f56fbb9ac8859"
+
+[[kernel]]
+name = "mxfp4_gemm_decode_arnq_bk128_ks2_tm1_wperm1_nt1_chk"
+symbol = "mxfp4_gemm_decode_arnq_bk128_ks2_tm1_wperm1_nt1_chk.kd"
+kernarg_segment_size = 464
+kernarg_segment_align = 8
+group_segment_fixed_size = 19640
+private_segment_fixed_size = 0
+vgpr_count = 103
+sgpr_count = 52
+wavefront_size = 32
+max_flat_workgroup_size = 256
+
+[[kernel.arg]]
+offset = 0
+size = 8
+value_kind = "global_buffer"
+name = "a"
+
+[[kernel.arg]]
+offset = 8
+size = 8
+value_kind = "global_buffer"
+name = "w"
+
+[[kernel.arg]]
+offset = 16
+size = 8
+value_kind = "global_buffer"
+name = "ws"
+
+[[kernel.arg]]
+offset = 24
+size = 8
+value_kind = "global_buffer"
+name = "wref"
+
+[[kernel.arg]]
+offset = 32
+size = 8
+value_kind = "global_buffer"
+name = "as"
+
+[[kernel.arg]]
+offset = 40
+size = 8
+value_kind = "global_buffer"
+name = "partial"
+
+[[kernel.arg]]
+offset = 48
+size = 8
+value_kind = "global_buffer"
+name = "counter"
+
+[[kernel.arg]]
+offset = 56
+size = 8
+value_kind = "global_buffer"
+name = "c"
+
+[[kernel.arg]]
+offset = 64
+size = 4
+value_kind = "by_value"
+name = "m"
+
+[[kernel.arg]]
+offset = 68
+size = 4
+value_kind = "by_value"
+name = "n"
+
+[[kernel.arg]]
+offset = 72
+size = 4
+value_kind = "by_value"
+name = "k"
+
+[[kernel.arg]]
+offset = 76
+size = 4
+value_kind = "by_value"
+name = "pb1"
+
+[[kernel.arg]]
+offset = 80
+size = 4
+value_kind = "by_value"
+name = "pb2"
+
+[[kernel.arg]]
+offset = 88
+size = 8
+value_kind = "by_value"
+name = "astride"
+
+[[kernel.arg]]
+offset = 96
+size = 8
+value_kind = "global_buffer"
+name = "peer_scratch"
+
+[[kernel.arg]]
+offset = 104
+size = 8
+value_kind = "global_buffer"
+name = "my_scratch"
+
+[[kernel.arg]]
+offset = 112
+size = 8
+value_kind = "global_buffer"
+name = "residual"
+
+[[kernel.arg]]
+offset = 120
+size = 8
+value_kind = "global_buffer"
+name = "norm_w"
+
+[[kernel.arg]]
+offset = 128
+size = 8
+value_kind = "global_buffer"
+name = "q_out"
+
+[[kernel.arg]]
+offset = 136
+size = 8
+value_kind = "global_buffer"
+name = "scale_out"
+
+[[kernel.arg]]
+offset = 144
+size = 8
+value_kind = "global_buffer"
+name = "res_out"
+
+[[kernel.arg]]
+offset = 152
+size = 8
+value_kind = "global_buffer"
+name = "peer_flags"
+
+[[kernel.arg]]
+offset = 160
+size = 8
+value_kind = "global_buffer"
+name = "my_flags"
+
+[[kernel.arg]]
+offset = 168
+size = 8
+value_kind = "global_buffer"
+name = "seq_ctrs"
+
+[[kernel.arg]]
+offset = 176
+size = 8
+value_kind = "global_buffer"
+name = "tiles"
+
+[[kernel.arg]]
+offset = 184
+size = 4
+value_kind = "by_value"
+name = "k16"
+
+[[kernel.arg]]
+offset = 188
+size = 4
+value_kind = "by_value"
+name = "slot_stride16"
+
+[[kernel.arg]]
+offset = 192
+size = 4
+value_kind = "by_value"
+name = "eps"
+
+[[kernel.arg]]
+offset = 196
+size = 4
+value_kind = "by_value"
+name = "drain"
+
+[[kernel.arg]]
+offset = 200
+size = 4
+value_kind = "by_value"
+name = "acq"
+
+[[kernel.arg]]
+offset = 204
+size = 4
+value_kind = "by_value"
+name = "ep_rows"
+
+[[kernel]]
+name = "mxfp4_gemm_decode_arnq_bk128_ks4_tm1_wperm1_nt1_chk"
+symbol = "mxfp4_gemm_decode_arnq_bk128_ks4_tm1_wperm1_nt1_chk.kd"
+kernarg_segment_size = 464
+kernarg_segment_align = 8
+group_segment_fixed_size = 19640
+private_segment_fixed_size = 0
+vgpr_count = 103
+sgpr_count = 54
+wavefront_size = 32
+max_flat_workgroup_size = 256
+
+[[kernel.arg]]
+offset = 0
+size = 8
+value_kind = "global_buffer"
+name = "a"
+
+[[kernel.arg]]
+offset = 8
+size = 8
+value_kind = "global_buffer"
+name = "w"
+
+[[kernel.arg]]
+offset = 16
+size = 8
+value_kind = "global_buffer"
+name = "ws"
+
+[[kernel.arg]]
+offset = 24
+size = 8
+value_kind = "global_buffer"
+name = "wref"
+
+[[kernel.arg]]
+offset = 32
+size = 8
+value_kind = "global_buffer"
+name = "as"
+
+[[kernel.arg]]
+offset = 40
+size = 8
+value_kind = "global_buffer"
+name = "partial"
+
+[[kernel.arg]]
+offset = 48
+size = 8
+value_kind = "global_buffer"
+name = "counter"
+
+[[kernel.arg]]
+offset = 56
+size = 8
+value_kind = "global_buffer"
+name = "c"
+
+[[kernel.arg]]
+offset = 64
+size = 4
+value_kind = "by_value"
+name = "m"
+
+[[kernel.arg]]
+offset = 68
+size = 4
+value_kind = "by_value"
+name = "n"
+
+[[kernel.arg]]
+offset = 72
+size = 4
+value_kind = "by_value"
+name = "k"
+
+[[kernel.arg]]
+offset = 76
+size = 4
+value_kind = "by_value"
+name = "pb1"
+
+[[kernel.arg]]
+offset = 80
+size = 4
+value_kind = "by_value"
+name = "pb2"
+
+[[kernel.arg]]
+offset = 88
+size = 8
+value_kind = "by_value"
+name = "astride"
+
+[[kernel.arg]]
+offset = 96
+size = 8
+value_kind = "global_buffer"
+name = "peer_scratch"
+
+[[kernel.arg]]
+offset = 104
+size = 8
+value_kind = "global_buffer"
+name = "my_scratch"
+
+[[kernel.arg]]
+offset = 112
+size = 8
+value_kind = "global_buffer"
+name = "residual"
+
+[[kernel.arg]]
+offset = 120
+size = 8
+value_kind = "global_buffer"
+name = "norm_w"
+
+[[kernel.arg]]
+offset = 128
+size = 8
+value_kind = "global_buffer"
+name = "q_out"
+
+[[kernel.arg]]
+offset = 136
+size = 8
+value_kind = "global_buffer"
+name = "scale_out"
+
+[[kernel.arg]]
+offset = 144
+size = 8
+value_kind = "global_buffer"
+name = "res_out"
+
+[[kernel.arg]]
+offset = 152
+size = 8
+value_kind = "global_buffer"
+name = "peer_flags"
+
+[[kernel.arg]]
+offset = 160
+size = 8
+value_kind = "global_buffer"
+name = "my_flags"
+
+[[kernel.arg]]
+offset = 168
+size = 8
+value_kind = "global_buffer"
+name = "seq_ctrs"
+
+[[kernel.arg]]
+offset = 176
+size = 8
+value_kind = "global_buffer"
+name = "tiles"
+
+[[kernel.arg]]
+offset = 184
+size = 4
+value_kind = "by_value"
+name = "k16"
+
+[[kernel.arg]]
+offset = 188
+size = 4
+value_kind = "by_value"
+name = "slot_stride16"
+
+[[kernel.arg]]
+offset = 192
+size = 4
+value_kind = "by_value"
+name = "eps"
+
+[[kernel.arg]]
+offset = 196
+size = 4
+value_kind = "by_value"
+name = "drain"
+
+[[kernel.arg]]
+offset = 200
+size = 4
+value_kind = "by_value"
+name = "acq"
+
+[[kernel.arg]]
+offset = 204
+size = 4
+value_kind = "by_value"
+name = "ep_rows"
+
+[[kernel]]
+name = "mxfp4_gemm_decode_arnq_bk64_ks4_tm1_wperm1_nt1_chk"
+symbol = "mxfp4_gemm_decode_arnq_bk64_ks4_tm1_wperm1_nt1_chk.kd"
+kernarg_segment_size = 464
+kernarg_segment_align = 8
+group_segment_fixed_size = 10424
+private_segment_fixed_size = 0
+vgpr_count = 84
+sgpr_count = 54
+wavefront_size = 32
+max_flat_workgroup_size = 256
+
+[[kernel.arg]]
+offset = 0
+size = 8
+value_kind = "global_buffer"
+name = "a"
+
+[[kernel.arg]]
+offset = 8
+size = 8
+value_kind = "global_buffer"
+name = "w"
+
+[[kernel.arg]]
+offset = 16
+size = 8
+value_kind = "global_buffer"
+name = "ws"
+
+[[kernel.arg]]
+offset = 24
+size = 8
+value_kind = "global_buffer"
+name = "wref"
+
+[[kernel.arg]]
+offset = 32
+size = 8
+value_kind = "global_buffer"
+name = "as"
+
+[[kernel.arg]]
+offset = 40
+size = 8
+value_kind = "global_buffer"
+name = "partial"
+
+[[kernel.arg]]
+offset = 48
+size = 8
+value_kind = "global_buffer"
+name = "counter"
+
+[[kernel.arg]]
+offset = 56
+size = 8
+value_kind = "global_buffer"
+name = "c"
+
+[[kernel.arg]]
+offset = 64
+size = 4
+value_kind = "by_value"
+name = "m"
+
+[[kernel.arg]]
+offset = 68
+size = 4
+value_kind = "by_value"
+name = "n"
+
+[[kernel.arg]]
+offset = 72
+size = 4
+value_kind = "by_value"
+name = "k"
+
+[[kernel.arg]]
+offset = 76
+size = 4
+value_kind = "by_value"
+name = "pb1"
+
+[[kernel.arg]]
+offset = 80
+size = 4
+value_kind = "by_value"
+name = "pb2"
+
+[[kernel.arg]]
+offset = 88
+size = 8
+value_kind = "by_value"
+name = "astride"
+
+[[kernel.arg]]
+offset = 96
+size = 8
+value_kind = "global_buffer"
+name = "peer_scratch"
+
+[[kernel.arg]]
+offset = 104
+size = 8
+value_kind = "global_buffer"
+name = "my_scratch"
+
+[[kernel.arg]]
+offset = 112
+size = 8
+value_kind = "global_buffer"
+name = "residual"
+
+[[kernel.arg]]
+offset = 120
+size = 8
+value_kind = "global_buffer"
+name = "norm_w"
+
+[[kernel.arg]]
+offset = 128
+size = 8
+value_kind = "global_buffer"
+name = "q_out"
+
+[[kernel.arg]]
+offset = 136
+size = 8
+value_kind = "global_buffer"
+name = "scale_out"
+
+[[kernel.arg]]
+offset = 144
+size = 8
+value_kind = "global_buffer"
+name = "res_out"
+
+[[kernel.arg]]
+offset = 152
+size = 8
+value_kind = "global_buffer"
+name = "peer_flags"
+
+[[kernel.arg]]
+offset = 160
+size = 8
+value_kind = "global_buffer"
+name = "my_flags"
+
+[[kernel.arg]]
+offset = 168
+size = 8
+value_kind = "global_buffer"
+name = "seq_ctrs"
+
+[[kernel.arg]]
+offset = 176
+size = 8
+value_kind = "global_buffer"
+name = "tiles"
+
+[[kernel.arg]]
+offset = 184
+size = 4
+value_kind = "by_value"
+name = "k16"
+
+[[kernel.arg]]
+offset = 188
+size = 4
+value_kind = "by_value"
+name = "slot_stride16"
+
+[[kernel.arg]]
+offset = 192
+size = 4
+value_kind = "by_value"
+name = "eps"
+
+[[kernel.arg]]
+offset = 196
+size = 4
+value_kind = "by_value"
+name = "drain"
+
+[[kernel.arg]]
+offset = 200
+size = 4
+value_kind = "by_value"
+name = "acq"
+
+[[kernel.arg]]
+offset = 204
+size = 4
+value_kind = "by_value"
+name = "ep_rows"

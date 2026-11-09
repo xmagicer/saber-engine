@@ -291,6 +291,27 @@ pub const REJECTED_PLUGINS: &[(&str, &str)] = &[(
 /// route row can describe it; `saber_exec::layer`'s block planner binds it when its fold fires.
 pub const SEPARATELY_PLANNED: &[(&str, &str)] = &[
     (
+        "saber_ar_host_exact",
+        "explicit registered-host transport: selected by saber::Ar::host_mapped, never a generic \
+         native-P2P autotune candidate because its buffers and bounded protocol belong to the \
+         host transport profile",
+    ),
+    (
+        "saber_ar_host_exact_chk",
+        "checked registered-host transport: selected only by the host profile's race diagnostic, \
+         never a generic serving/autotune candidate",
+    ),
+    (
+        "mxfp4_gemm_decode_host_arnq",
+        "registered-host GEMM/reduce/norm fusion: selected explicitly by the block planner for \
+         the host transport, not an implementation of a single generic model op",
+    ),
+    (
+        "mxfp4_gemm_decode_host_arnq_chk",
+        "checked registered-host GEMM/reduce/norm fusion: selected only by the host profile's \
+         race diagnostic, not an implementation of a single generic model op",
+    ),
+    (
         "flashnext_attn",
         "Flash-Next (FN6): the reference's attention bodies at GQA 12 over bf16 K/V pages -- planned \
          by `saber_kernels::fn6` for the qwen4_exp QSA layers (F2), never a row of the 27B's \

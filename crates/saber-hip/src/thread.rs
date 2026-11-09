@@ -1523,7 +1523,16 @@ impl HipThread {
         })
     }
 
-    /// `hipMemsetAsync` over a whole allocation.
+    /// Queue zeroing of owned registered shared pages on the selected stream.
+    pub fn memset_shared_zero(&self, dst: &crate::SharedHost, stream: &Stream) -> Result<()> {
+        let (d, bytes, st) = (dst.addr(), dst.len(), stream.raw);
+        self.run_with(Deps::on1(Name::Stream(st)), move |lib, ctx| {
+            // SAFETY: dst owns this registration and bounds; the stream orders the reset.
+            unsafe { lib.memset_async(ctx, d.as_ptr(), 0, bytes, st.as_ptr()) }
+        })
+    }
+
+    /// `hipMemsetAsync` over a whole device allocation.
     pub fn memset(&self, dst: &DevicePtr, value: u8, stream: &Stream) -> Result<()> {
         let (d, bytes, st) = (dst.addr(), dst.len(), stream.raw);
         self.run_with(Deps::on1(Name::Stream(st)), move |lib, ctx| {

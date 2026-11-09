@@ -121,7 +121,7 @@ raw_token!(
 );
 
 /// Post a destructor to the HIP thread. Never panics: a failed teardown is logged, not raised.
-fn post_destructor<F>(tx: &Sender<Msg>, resource: &'static str, f: F)
+pub(crate) fn post_destructor<F>(tx: &Sender<Msg>, resource: &'static str, f: F)
 where
     F: FnOnce(&Lib, &Ctx) -> Result<()> + Send + 'static,
 {

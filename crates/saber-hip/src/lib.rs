@@ -60,7 +60,9 @@ mod lane;
 pub mod pinned;
 pub mod process;
 mod rccl;
+mod shared_host;
 pub mod shmline;
+pub use shared_host::SharedHost;
 mod thread;
 
 pub use device::{ArchSource, DeviceAttribute, DeviceInfo, HipVersion, Topology};

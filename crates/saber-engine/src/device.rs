@@ -649,6 +649,12 @@ pub struct EngineConfig {
     pub hip_lib: String,
     /// Explicit RCCL compatibility backend; `None` retains the native P2P backend.
     pub rccl_lib: Option<String>,
+    /// Explicit native exact collectives over registered shared host pages.
+    pub host_ar: bool,
+    /// Diagnostic export of committed target features; rank 0, one sequence, no prefix caching.
+    pub draft_capture_dir: Option<PathBuf>,
+    /// Optional independent capture-layer plane; forwarded to both TP ranks.
+    pub draft_capture_layers: Vec<u32>,
     /// HIP device ordinal within the visible set.
     pub device: i32,
     /// Refuse to start if the engine's device buffers would exceed this. The byte ledger is the
@@ -3051,6 +3057,8 @@ struct Seam {
 /// the five taps differ only in which edge they read and which column block they write, both of
 /// which are bindings.
 struct AuxTap {
+    capture_extra: Option<(crate::aux_tap::AuxTapPlan, DevicePtr)>,
+    capture: Option<std::sync::Mutex<crate::draft_capture::TargetAuxCapture>>,
     plan: crate::aux_tap::AuxTapPlan,
     /// `[rows, 5 * hidden]` bf16.
     buf: DevicePtr,
@@ -3063,6 +3071,50 @@ struct AuxTap {
 }
 
 impl AuxTap {
+    fn capture_rows(
+        &self,
+        hip: &HipThread,
+        stream: &Stream,
+        seq: SeqId,
+        position: u32,
+        tokens: &[TokenId],
+        row0: usize,
+        kind: &str,
+    ) -> Result<(), ForwardError> {
+        let Some(capture) = &self.capture else {
+            return Ok(());
+        };
+        if row0 + tokens.len() > self.rows as usize {
+            return Err(ForwardError::Device(
+                "target capture window exceeds auxiliary buffer".into(),
+            ));
+        }
+        let (capture_plan, capture_buf) = self
+            .capture_extra
+            .as_ref()
+            .map(|(p, b)| (p, b))
+            .unwrap_or((&self.plan, &self.buf));
+        let row_bytes = capture_plan.row_elems() as usize * 2;
+        let addr = capture_buf
+            .addr()
+            .offset((row0 * row_bytes) as u64)
+            .ok_or_else(|| ForwardError::Device("target capture address overflow".into()))?;
+        let mut bytes = vec![0; tokens.len() * row_bytes];
+        hip.sync_stream(stream)
+            .map_err(device_err("target capture completion"))?;
+        hip.memcpy_d2h_addr_blocking(&mut bytes, addr, stream)
+            .map_err(device_err("target capture readback"))?;
+        capture
+            .lock()
+            .map_err(|_| ForwardError::Device("target capture lock poisoned".into()))?
+            .record(seq, position, tokens, &bytes, kind)
+            .map_err(device_err("target capture write"))
+    }
+
+    fn launches(&self) -> u32 {
+        self.plan.launches() + self.capture_extra.as_ref().map_or(0, |(p, _)| p.launches())
+    }
+
     /// Where tap `k`'s column block starts.
     fn out(&self, k: usize) -> Result<DeviceAddr, ForwardError> {
         self.buf
@@ -4384,7 +4436,44 @@ fn run(
     mut phases: crate::startup::Phases,
 ) -> Result<(), ForwardError> {
     use crate::startup::Phase as Boot;
+    if cfg.draft_capture_dir.is_some() && (cfg.max_seqs != 1 || cfg.draft_pack.is_none()) {
+        return Err(ForwardError::Device("target feature capture requires max-seqs=1 and a resident drafter; disable prefix caching".into()));
+    }
+    if !cfg.draft_capture_layers.is_empty() {
+        if cfg.draft_capture_layers.len() != crate::draft_inputs::AUX_TAPS.len()
+            || cfg
+                .draft_capture_layers
+                .iter()
+                .any(|l| *l >= graph.config.num_hidden_layers)
+        {
+            return Err(ForwardError::Device(
+                "capture layer plane must have five valid target layers".into(),
+            ));
+        }
+        crate::aux_tap::AuxTapPlan::for_layers(
+            graph.config.hidden_size,
+            &cfg.draft_capture_layers,
+        )?;
+        if cfg.rank == 0 && cfg.draft_capture_dir.is_none() {
+            return Err(ForwardError::Device(
+                "capture layers require a rank-zero capture directory".into(),
+            ));
+        }
+    }
     let mut resolved = cfg.clone();
+    if resolved.host_ar {
+        if resolved.world != 2 {
+            return Err(ForwardError::Device("host collectives require TP=2".into()));
+        }
+        resolved.ar_exact = true;
+        resolved.ar_fuse = false;
+        resolved.ar_wpar = false;
+        resolved.device_step = crate::device_step::DeviceStep::Off;
+        println!(
+            "collectives rank {}: registered shared host pages, bounded exact BF16 kernels; no P2P",
+            resolved.rank
+        );
+    }
     if resolved.rccl_lib.is_some() {
         if resolved.world != 2 {
             return Err(ForwardError::Device(
@@ -4596,11 +4685,24 @@ fn run(
     let mut saber = SaberRules::prod_saber().map_err(device_err("saber rules"))?;
     if cfg.rccl_lib.is_some() {
         saber.ar.external_rccl = true;
+        if cfg.host_ar {
+            // Every served 27B decode rectangle has at most 64 rows. Larger
+            // messages use RCCL's bulk transfer; small ones keep native fusion.
+            saber.ar.external_rccl_min_bytes = u64::from(graph.config.hidden_size) * 65 * 2;
+            println!("collectives rank {}: hybrid RCCL for >= {} B; smaller exact collectives use registered host pages", cfg.rank, saber.ar.external_rccl_min_bytes);
+        }
         saber.name = format!("{}+rccl-bf16", saber.name);
     }
     // T4: every all-reduce resolves to its race-check twin. Set before any plan resolves a reduce,
     // so the target's, the drafter's and row 3's fold all see the same answer.
     saber.ar.race_check = cfg.race_check;
+    saber.ar.host_mapped = cfg.host_ar;
+    if cfg.host_ar {
+        println!(
+            "hostfence rank {}: store drain {} / acquire {}; registered fine-grained shared pages",
+            cfg.rank, saber.ar.drain, saber.ar.acq
+        );
+    }
     if cfg.ar_wpar {
         // CMP27S: the wave-parallel wht6 body for every rotated reduce whose chunks a block fit
         // its LDS (the prefill rungs, the drafter and the decode graphs alike). The route is a
@@ -4675,10 +4777,17 @@ fn run(
     if let Some(p) = &peer {
         p.agree(
             "engine.collective-backend",
-            u64::from(cfg.rccl_lib.is_some()),
+            u64::from(cfg.rccl_lib.is_some()) | (u64::from(cfg.host_ar) << 1),
         )
         .map_err(|e| ForwardError::Peer(e.to_string()))?;
     }
+    // RCCL retains its previous eager stream to record cross-stream completion
+    // events on the next call. Warm on the model's lifetime stream: destroying
+    // a temporary warm stream leaves a dangling handle when decode graphs use
+    // native collectives and do not update RCCL's remembered stream.
+    let stream = hip
+        .create_stream(StreamFlags::NonBlocking)
+        .map_err(device_err("create_stream"))?;
     let rccl = if let Some(path) = &cfg.rccl_lib {
         let p = peer
             .as_ref()
@@ -4710,9 +4819,6 @@ fn run(
             let warm = hip
                 .malloc(saber.ar.max_bytes)
                 .map_err(device_err("RCCL warm buffer"))?;
-            let stream = hip
-                .create_stream(saber_hip::StreamFlags::NonBlocking)
-                .map_err(device_err("RCCL warm stream"))?;
             hip.memset(&warm, 0, &stream)
                 .map_err(device_err("RCCL warm zero"))?;
             hip.rccl_all_reduce_bf16(
@@ -4863,6 +4969,36 @@ fn run(
                 bytes >> 20
             ))
         })
+    }
+
+    let independent_capture = !cfg.draft_capture_layers.is_empty()
+        && cfg.draft_capture_layers.as_slice() != crate::draft_inputs::AUX_TAPS;
+    let capture_max_rows = cfg.prefill_rows.iter().copied().max().unwrap_or(1).max(
+        cfg.max_seqs
+            * cfg
+                .decode_widths
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(1)
+                .max(crate::spec_tree::TREE_MAX_ROWS as u32),
+    );
+    let capture_extra_bytes = if independent_capture {
+        u64::from(capture_max_rows)
+            * u64::from(graph.config.hidden_size)
+            * cfg.draft_capture_layers.len() as u64
+            * 2
+    } else {
+        0
+    };
+    if capture_extra_bytes > 0 {
+        bill(
+            &mut budget,
+            &mut ledger,
+            cfg.rank,
+            capture_extra_bytes,
+            "engine.draft.capture_aux",
+        )?;
     }
 
     phases.record(Boot::PeerExchange, mark.elapsed(), "the socket");
@@ -5614,10 +5750,6 @@ fn run(
         .functions(hip)
         .map_err(device_err("plugin symbols"))?;
     let ctx = LaunchCtx::new(hip, &functions);
-    let stream = hip
-        .create_stream(StreamFlags::NonBlocking)
-        .map_err(device_err("create_stream"))?;
-
     phases.record(
         Boot::CodeObjects,
         mark.elapsed(),
@@ -5946,9 +6078,19 @@ fn run(
             uplan.staging_bytes.max(1)
                 + cfg.park_staging_bytes
                 + cfg.park_tier_bytes
-                + vision_host.map_or(0, |(a, b)| a + b),
+                + vision_host.map_or(0, |(a, b)| a + b)
+                + if cfg.host_ar { 1024 * 1024 * 1024 } else { 0 },
         )
         .map_err(device_err("declaring pinned host"))?;
+    if cfg.host_ar {
+        ledger
+            .reserve(
+                Pool::HostPinned,
+                "engine.collectives.host-cap",
+                1024 * 1024 * 1024,
+            )
+            .map_err(device_err("reserving shared host collective pages"))?;
+    }
     let reserved = upload
         .reserve(&mut ledger)
         .map_err(device_err("reserving the upload"))?;
@@ -7049,7 +7191,12 @@ fn run(
     // tap object exists because the budget is a property of the plan and the tap is a property of
     // the card.
     let tap_launches = if cfg.draft_block > 0 {
-        crate::draft_inputs::AUX_TAPS.len() as u32
+        (crate::draft_inputs::AUX_TAPS.len()
+            + if independent_capture {
+                cfg.draft_capture_layers.len()
+            } else {
+                0
+            }) as u32
     } else {
         0
     };
@@ -7112,7 +7259,18 @@ fn run(
         None
     } else {
         let plan = crate::aux_tap::AuxTapPlan::new(hidden);
-        debug_assert_eq!(plan.launches(), tap_launches);
+        let capture_plan = if independent_capture {
+            Some(crate::aux_tap::AuxTapPlan::for_layers(
+                hidden,
+                &cfg.draft_capture_layers,
+            )?)
+        } else {
+            None
+        };
+        debug_assert_eq!(
+            plan.launches() + capture_plan.as_ref().map_or(0, |p| p.launches()),
+            tap_launches
+        );
         let mut descs: BTreeMap<u32, LaunchDescriptor> = BTreeMap::new();
         let mut rows = 0u32;
         let mut decode_shapes = 0u32;
@@ -7128,7 +7286,11 @@ fn run(
             // EVERY tapped edge must be an edge of the real plan. A tap on a name the planner does
             // not carry would bind nothing and copy whatever the arena held — which is the failure
             // this whole module is arranged against — so it is a refusal at boot, by name.
-            for e in &plan.edges {
+            for e in plan
+                .edges
+                .iter()
+                .chain(capture_plan.iter().flat_map(|p| p.edges.iter()))
+            {
                 if p.plan.locate(e).is_none() {
                     return Err(ForwardError::Device(format!(
                         "the aux tap reads `{e}` and the {:?} plan at {} rows has no such edge: \
@@ -7166,7 +7328,42 @@ fn run(
             plan.launches(),
             plan.row_elems(),
         );
+        let capture_extra = if let Some(p) = capture_plan {
+            let bytes = p.bytes(rows);
+            if bytes > capture_extra_bytes {
+                return Err(ForwardError::Device(
+                    "independent capture exceeds its pre-pool reservation".into(),
+                ));
+            }
+            let buffer = hip
+                .malloc(bytes)
+                .map_err(device_err("allocating independent capture"))?;
+            hip.memset(&buffer, 0, &stream)
+                .map_err(device_err("zeroing independent capture"))?;
+            Some((p, buffer))
+        } else {
+            None
+        };
+        let output_plan = capture_extra.as_ref().map(|(p, _)| p).unwrap_or(&plan);
+        let capture = if cfg.rank == 0 {
+            cfg.draft_capture_dir
+                .as_ref()
+                .map(|dir| {
+                    crate::draft_capture::TargetAuxCapture::new(
+                        dir,
+                        output_plan.hidden,
+                        &output_plan.layers,
+                    )
+                })
+                .transpose()
+                .map_err(device_err("creating target capture"))?
+                .map(std::sync::Mutex::new)
+        } else {
+            None
+        };
         Some(AuxTap {
+            capture_extra,
+            capture,
             plan,
             buf,
             rows,
@@ -7194,6 +7391,9 @@ fn run(
     }
     if let Some(p) = &peer {
         launcher = launcher.with_peer(Arc::clone(p));
+    }
+    if cfg.host_ar {
+        launcher = launcher.with_host_ar();
     }
     let capture_counters = Arc::new(CaptureCounters::new());
     let peer_capture = if cfg.world > 1 {
@@ -7901,6 +8101,19 @@ fn run(
             launcher.ipc_bytes(),
             "engine.ipc",
         )?;
+        if cfg.host_ar {
+            ledger
+                .release(Pool::HostPinned, "engine.collectives.host-cap")
+                .map_err(device_err("reconciling host collective pages"))?;
+            ledger
+                .reserve(
+                    Pool::HostPinned,
+                    "engine.collectives.host",
+                    launcher.host_ipc_bytes(),
+                )
+                .map_err(device_err("billing shared host collective pages"))?;
+            println!("hostcollectives rank {}: {} MiB registered shared pages; native exact kernels, no peer access", cfg.rank, launcher.host_ipc_bytes() >> 20);
+        }
         tracing::info!(
             rank = cfg.rank,
             collectives,
@@ -8067,7 +8280,9 @@ fn run(
             .map_err(device_err("the tree flush's table"))?;
         // CMP27L (`--engine-b1-arms adv|all`): the per-layer advances as ONE launch over
         // `[layers]` tables of the same state / record bases, at the same strides.
-        let advance_layers = if cfg.b1_arms.adv_batch {
+        // The batched object is compiled for the 10-row record. The 16-row form uses its
+        // existing per-layer advance; reusing the 10-row offsets would corrupt state.
+        let advance_layers = if cfg.b1_arms.adv_batch && tree_rows == 10 {
             let d0 = advance.first().map(|a| a.0.clone()).ok_or_else(|| {
                 ForwardError::Device("--engine-b1-arms adv: no tree advance".to_owned())
             })?;
@@ -8108,6 +8323,9 @@ fn run(
             );
             Some((d, states, records))
         } else {
+            if cfg.b1_arms.adv_batch && tree_rows == 16 {
+                println!("b1arms rank {}: best16 uses the 16-row per-layer state advance; the batched object is 10-row only", cfg.rank);
+            }
             None
         };
         println!(
@@ -8633,7 +8851,7 @@ fn run(
         }),
         aux_tap: aux_tap.as_ref().map(|t| crate::forward::AuxTapFacts {
             layers: t.plan.layers.clone(),
-            launches: t.plan.launches(),
+            launches: t.launches(),
             rows: t.rows,
             bytes: t.plan.bytes(t.rows),
         }),
@@ -15989,34 +16207,51 @@ fn insert_aux_taps<'a>(
     let base = body.exec.arena_base();
     let layers = tap.layers_in_model;
     // The op each copy follows -> which taps go after it.
-    let mut after: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for k in 0..tap.plan.layers.len() {
-        let mut op = tap.plan.after(k, mode, layers)?;
-        // ws-h37: under `--decode-fusion` the op the tap follows (`input_layernorm`) is FOLDED
-        // into the reduce before it (`_nq`), so it issues nothing and has no bound step: the copy
-        // follows the dispatch that now writes the edge. A fused route names that dispatch --
-        // since ws-h38 (fusion-map row 3) that is the PREVIOUS layer's `down_proj` GEMM, whose
-        // row owners write the norm's `res_out`; the reduce between them is fused into it too.
-        if let Some(saber_exec::Route::Fused { into, .. }) = body
-            .plan
-            .steps
-            .iter()
-            .find(|s| s.name() == op)
-            .map(|s| &s.route)
-        {
-            op = into.clone();
-        }
-        after.entry(op).or_default().push(k);
+    let mut planes = vec![(&tap.plan, &tap.buf)];
+    if let Some((p, b)) = &tap.capture_extra {
+        planes.push((p, b));
     }
-    let mut out: Vec<BoundStep<'a>> = Vec::with_capacity(steps.len() + tap.plan.layers.len());
+    let mut after: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+    for (plane, (plan, _)) in planes.iter().enumerate() {
+        for k in 0..plan.layers.len() {
+            let mut op = plan.after(k, mode, layers)?;
+            // ws-h37: under `--decode-fusion` the op the tap follows (`input_layernorm`) is FOLDED
+            // into the reduce before it (`_nq`), so it issues nothing and has no bound step: the copy
+            // follows the dispatch that now writes the edge. A fused route names that dispatch --
+            // since ws-h38 (fusion-map row 3) that is the PREVIOUS layer's `down_proj` GEMM, whose
+            // row owners write the norm's `res_out`; the reduce between them is fused into it too.
+            if let Some(saber_exec::Route::Fused { into, .. }) = body
+                .plan
+                .steps
+                .iter()
+                .find(|s| s.name() == op)
+                .map(|s| &s.route)
+            {
+                op = into.clone();
+            }
+            after.entry(op).or_default().push((plane, k));
+        }
+    }
+    let mut out: Vec<BoundStep<'a>> = Vec::with_capacity(steps.len() + tap.launches() as usize);
     let mut placed = 0usize;
     for step in steps {
         let ks = after.get(step.name).cloned().unwrap_or_default();
         out.push(step);
-        for k in ks {
+        for (plane, k) in ks {
+            let (plan, buffer) = planes[plane];
             let mut a = ArgBindings::new(Shape::new(0, 0, 0));
-            a.bind("src", at(&body.plan, base, &tap.plan.edges[k])?);
-            a.bind("out", tap.out(k)?);
+            a.bind("src", at(&body.plan, base, &plan.edges[k])?);
+            a.bind(
+                "out",
+                if plane == 0 {
+                    tap.out(k)?
+                } else {
+                    buffer
+                        .addr()
+                        .offset(plan.block_offset(k))
+                        .ok_or_else(|| ForwardError::Device("capture tap offset overflow".into()))?
+                },
+            );
             out.push(BoundStep {
                 name: "draft.aux_tap",
                 descs: std::slice::from_ref(desc),
@@ -16025,11 +16260,11 @@ fn insert_aux_taps<'a>(
             placed += 1;
         }
     }
-    if placed != tap.plan.layers.len() {
+    if placed != tap.launches() as usize {
         return Err(ForwardError::Device(format!(
             "the aux tap placed {placed} of its {} copies: an op it names is not in this plan's \
              bound step list, so the drafter would read whatever `aux.cat` held",
-            tap.plan.layers.len()
+            tap.launches()
         )));
     }
     Ok(out)
@@ -19726,6 +19961,7 @@ fn prefill_step(
     let mut prefill_block: Vec<TokenId> = Vec::new();
     let mut prefill_pending: Vec<SeqId> = Vec::new();
     if let Some((res, t, tier)) = drafter {
+        t.capture_rows(hip, stream, seq, done, tokens, 0, "prefill")?;
         let block = res.cfg.block_size;
         let geom_d = crate::draft_inputs::DraftGeometry {
             block,
@@ -21316,6 +21552,36 @@ fn decode_step(
     // committed the model's own tokens, and a drafter that could not run costs a narrower next
     // step, never a wrong one.
     trace.stop(HostPhase::Accept, t_accept);
+    if let Some(t) = tap {
+        if t.capture.is_some() {
+            if slots.len() != 1 || tree_plan.is_some() || tap_gate.is_some() {
+                return Err(ForwardError::Device(
+                    "target capture supports one ordinary chain sequence only".into(),
+                ));
+            }
+            let slot = &slots[0];
+            let committed = commits.first().ok_or_else(|| {
+                ForwardError::Device("target capture has no committed slot".into())
+            })?;
+            let mut inputs = vec![slot.input];
+            inputs.extend(slot.draft.iter().take(committed.accepted as usize).copied());
+            if inputs.len() != committed.tokens.len() {
+                return Err(ForwardError::Device(
+                    "target capture accepted input count mismatch".into(),
+                ));
+            }
+            t.capture_rows(
+                hip,
+                stream,
+                slot.seq,
+                slot.context_len,
+                &inputs,
+                starts[0],
+                "decode",
+            )?;
+        }
+    }
+
     let mut drafts: Vec<Vec<TokenId>> = Vec::new();
     let mut proposal_pending: Vec<SeqId> = Vec::new();
     if let (Some((res, tier)), Some(t), None) = (drafter, tap, tap_gate) {

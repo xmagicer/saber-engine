@@ -76,6 +76,12 @@ pub struct EngineArgs {
     pub hip_lib: String,
     /// Optional RCCL compatibility library; selects host-capable collectives.
     pub rccl_lib: Option<String>,
+    /// Explicit native exact collectives over registered shared host pages.
+    pub host_ar: bool,
+    /// Diagnostic rank-zero target-feature capture for offline draft validation.
+    pub draft_capture_dir: Option<PathBuf>,
+    /// Independent target feature plane used by offline draft validation.
+    pub draft_capture_layers: Vec<u32>,
     /// HIP device ordinal within the visible set.
     pub device: i32,
     /// Refuse to start if the engine's device buffers would exceed this.
@@ -382,6 +388,13 @@ impl EngineArgs {
             prebuilt: self.prebuilt.clone(),
             hip_lib: self.hip_lib.clone(),
             rccl_lib: self.rccl_lib.clone(),
+            host_ar: self.host_ar,
+            draft_capture_layers: self.draft_capture_layers.clone(),
+            draft_capture_dir: if self.rank == 0 {
+                self.draft_capture_dir.clone()
+            } else {
+                None
+            },
             device: self.device,
             budget_mib: self.budget_mib,
             max_seqs: self.max_seqs,
@@ -10230,8 +10243,20 @@ impl Worker {
             // Keep the follower on the leader's explicitly selected transport.
             cmd.arg("--no-capture");
         }
+        if args.host_ar {
+            cmd.arg("--host-ar");
+        }
         if let Some(path) = &args.rccl_lib {
             cmd.arg("--rccl-lib").arg(path);
+        }
+        if !args.draft_capture_layers.is_empty() {
+            cmd.arg("--draft-capture-layers").arg(
+                args.draft_capture_layers
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
         }
         // D4: the tower on rank 1 too (replicated), sized as the leader's.
         if args.vision_max_patches > 0 {
@@ -11324,6 +11349,9 @@ mod ar_band_tests {
             prebuilt: std::path::PathBuf::from("prebuilt/gfx1201"),
             hip_lib: saber_hip::DEFAULT_HIP_SONAME.to_owned(),
             rccl_lib: None,
+            host_ar: false,
+            draft_capture_dir: None,
+            draft_capture_layers: Vec::new(),
             device: 0,
             budget_mib: 26000,
             max_seqs: 2,

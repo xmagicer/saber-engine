@@ -44,7 +44,9 @@ static __device__ __forceinline__ T ld_w(const T *p) {
 // last block also runs the exact two-rank all-reduce and the `_nq` epilogue. The
 // epilogue below is SLICED from the generated saber_ar_exact.hip (`arnq_epilogue`).
 #include <hip/hip_fp16.h>
+#ifndef SABER_AR_SPIN_MAX
 #define SABER_AR_SPIN_MAX 4000000000ULL
+#endif
 #define SABER_ARNQ_T 256
 #define SABER_ARNQ_MAXG 5
 

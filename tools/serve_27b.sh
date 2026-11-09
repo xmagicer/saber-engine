@@ -121,6 +121,13 @@ while [ $# -gt 0 ]; do
     *) ARGS+=("$1"); shift ;;
   esac
 done
+for arg in "${ARGS[@]}"; do
+  if [ "$arg" = "--engine-host-ar" ]; then
+    [ "$TP" = 2 ] || { echo "--engine-host-ar requires TP=2" >&2; exit 2; }
+    # Registered host transfers share the model queue, like the RCCL profile.
+    COLLECTIVE_GPU_QUEUES=1
+  fi
+done
 if [ -n "$WARM" ]; then
   [ -f "$WARM" ] || { echo "--warm-prompts: no file '$WARM'" >&2; exit 1; }
   cp -- "$WARM" "$OUT/warm-prompts.txt" || exit 1

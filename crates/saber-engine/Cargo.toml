@@ -20,6 +20,7 @@ saber-serve = { path = "../saber-serve" }
 # No `anyhow`: every error this crate produces is a `ForwardError` the step loop has to match on.
 thiserror = { workspace = true }
 tracing = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # The host gate drives the real scheduler and drains a real per-request event stream: the stream is
@@ -28,7 +29,6 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", 
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # `tests/draft_inputs_gate.rs` reads the proposal captures' JSON manifests. The tensors are flat
 # uint8 `.npy` and the test parses those itself; only the manifest needs a JSON reader.
-serde_json = { workspace = true }
 # `tests/census_parity.rs` (ws-v8) scrapes `/metrics` over a real socket from the real router.
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 axum = { version = "0.8", features = ["tokio", "http1"] }

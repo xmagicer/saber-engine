@@ -76,6 +76,24 @@ impl AuxTapPlan {
         }
     }
 
+    /// A separately owned feature plane, in an explicitly requested checkpoint order.
+    pub fn for_layers(hidden: u32, layers: &[u32]) -> Result<Self, ForwardError> {
+        if hidden == 0
+            || layers.is_empty()
+            || layers.iter().any(|x| *x == 0)
+            || layers.windows(2).any(|w| w[0] >= w[1])
+        {
+            return Err(ForwardError::Device(
+                "auxiliary layers must be positive, unique and increasing".into(),
+            ));
+        }
+        Ok(Self {
+            hidden,
+            layers: layers.to_vec(),
+            edges: layers.iter().map(|l| format!("l{l}.resid.a")).collect(),
+        })
+    }
+
     /// Copies one step issues: one per tapped layer.
     #[must_use]
     pub fn launches(&self) -> u32 {
@@ -185,6 +203,27 @@ impl TapVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_checkpoint_taps_preserve_order_and_geometry() {
+        let p = AuxTapPlan::for_layers(5120, &[1, 16, 31, 46, 61]).unwrap();
+        assert_eq!(
+            p.edges,
+            [
+                "l1.resid.a",
+                "l16.resid.a",
+                "l31.resid.a",
+                "l46.resid.a",
+                "l61.resid.a"
+            ]
+        );
+        assert_eq!(p.bytes(16), 16 * 5 * 5120 * 2);
+        assert_eq!(AuxTapPlan::new(5120).layers, AUX_TAPS);
+        for layers in [&[][..], &[0, 1], &[1, 1], &[2, 1]] {
+            assert!(AuxTapPlan::for_layers(5120, layers).is_err());
+        }
+        assert!(AuxTapPlan::for_layers(0, &[1]).is_err());
+    }
 
     /// The geometry the task states, and the stride that makes it one buffer.
     ///

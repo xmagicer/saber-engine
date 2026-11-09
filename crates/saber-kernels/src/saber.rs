@@ -114,6 +114,13 @@ pub struct Ar {
     /// Explicit runtime backend choice; native rule files keep their existing semantics.
     #[serde(skip)]
     pub external_rccl: bool,
+    /// With a host-mapped backend, smaller messages retain native fused kernels.
+    /// Zero keeps the all-RCCL compatibility profile's existing behavior.
+    #[serde(skip)]
+    pub external_rccl_min_bytes: u64,
+    /// Exact kernels over registered shared host memory, with short bounded waits.
+    #[serde(skip)]
+    pub host_mapped: bool,
     pub group: u32,
     pub max_blocks: u32,
     pub chunk_groups_even_bits: u32,
@@ -151,6 +158,12 @@ pub struct Ar {
 pub const AR_WPAR_SYMBOL: &str = "saber_ar_wpar_2rank_wht6_bf16";
 /// Runtime-provided collective implementation, not a HIP code object.
 pub const RCCL_PLUGIN: &str = "saber_rccl";
+
+/// Whether this exact message belongs to the external collective backend.
+#[must_use]
+pub fn uses_rccl(rules: &SaberRules, bytes: u64) -> bool {
+    rules.ar.external_rccl && bytes >= rules.ar.external_rccl_min_bytes
+}
 /// External BF16 sum entry with [`abi::SIG_RCCL_BF16`].
 pub const RCCL_BF16_KERNEL: &str = "nccl_allreduce_bf16";
 /// The served symbol [`AR_WPAR_SYMBOL`] replaces.
@@ -1512,6 +1525,20 @@ pub fn resolve_with(
         }
         (o, _) => Err(Error::Rule(format!(
             "{o:?} was handed a shape of the wrong kind"
+        ))),
+    }
+}
+
+fn collective_plugin(symbol: &str, rules: &SaberRules) -> Result<&'static str> {
+    let native = plugin_for(symbol)?;
+    if !rules.ar.host_mapped {
+        return Ok(native);
+    }
+    match native {
+        "saber_ar_exact" => Ok("saber_ar_host_exact"),
+        "saber_ar_exact_chk" => Ok("saber_ar_host_exact_chk"),
+        other => Err(Error::Rule(format!(
+            "host collectives require bounded exact kernels, got {other}"
         ))),
     }
 }
@@ -3141,7 +3168,13 @@ pub fn tree_gdn_advance(s: GdnShape) -> Result<LaunchDescriptor> {
             "gdn_tree_advance: built for the f16 stored state at k128 v128".into(),
         ));
     }
-    let rec = i64::from(TREE_REC_FLOATS);
+    if s.maxq > TREE16_ROWS {
+        return Err(Error::Rule(
+            "gdn_tree_advance: query span exceeds the 16-row record".into(),
+        ));
+    }
+    let wide = s.maxq > TREE_ROWS;
+    let rec = i64::from(tree_rec_floats(if wide { TREE16_ROWS } else { TREE_ROWS }));
     let (args, bytes) = KArgs::new(abi::SIG_P27_GDN_TREE_ADVANCE)
         .buf("state")
         .i64(s.st_slot)
@@ -3155,8 +3188,18 @@ pub fn tree_gdn_advance(s: GdnShape) -> Result<LaunchDescriptor> {
         .finish()?;
     Ok(LaunchDescriptor {
         op: "gdn_tree_advance".into(),
-        plugin: "p27_tree_gdn".into(),
-        kernel: "p27_gdn_tree_advance_f16s_k128_v128".into(),
+        plugin: if wide {
+            "p27_tree_gdn16"
+        } else {
+            "p27_tree_gdn"
+        }
+        .into(),
+        kernel: if wide {
+            "p27_gdn_tree16_advance_f16s_k128_v128"
+        } else {
+            "p27_gdn_tree_advance_f16s_k128_v128"
+        }
+        .into(),
         grid: [s.n_seqs, s.h, 1],
         block: [256, 1, 1],
         shared_bytes: 0,
@@ -3304,12 +3347,16 @@ pub fn tree_gdn_advance_like(update: &LaunchDescriptor) -> Result<LaunchDescript
             ))),
         }
     };
-    if !update.kernel.starts_with("p27_gdn_tree_f16s_k128_v128") {
+    let (plugin, kernel) = if update.kernel.starts_with("p27_gdn_tree16_f16s_k128_v128") {
+        ("p27_tree_gdn16", "p27_gdn_tree16_advance_f16s_k128_v128")
+    } else if update.kernel.starts_with("p27_gdn_tree_f16s_k128_v128") {
+        ("p27_tree_gdn", "p27_gdn_tree_advance_f16s_k128_v128")
+    } else {
         return Err(Error::Rule(format!(
             "gdn_tree_advance: built for the f16 stored state at k128 v128, not `{}`",
             update.kernel
         )));
-    }
+    };
     let (args, bytes) = KArgs::new(abi::SIG_P27_GDN_TREE_ADVANCE)
         .buf("state")
         .i64(imm("st_slot")?)
@@ -3323,8 +3370,8 @@ pub fn tree_gdn_advance_like(update: &LaunchDescriptor) -> Result<LaunchDescript
         .finish()?;
     Ok(LaunchDescriptor {
         op: "gdn_tree_advance".into(),
-        plugin: "p27_tree_gdn".into(),
-        kernel: "p27_gdn_tree_advance_f16s_k128_v128".into(),
+        plugin: plugin.into(),
+        kernel: kernel.into(),
         grid: [1, update.grid[1], 1],
         block: [256, 1, 1],
         shared_bytes: 0,
@@ -3678,7 +3725,7 @@ fn ar_family(
     rules: &SaberRules,
     names: ArNames<'_>,
 ) -> Result<LaunchDescriptor> {
-    if rules.ar.external_rccl {
+    if rules.ar.external_rccl || rules.ar.host_mapped {
         return ar_exact(s, dtype, reg, rules, names);
     }
     // The size decides the `exact` key; the registry decides the kernel. Same split the reference draws,
@@ -3744,7 +3791,7 @@ fn ar_exact(
     rules: &SaberRules,
     names: ArNames<'_>,
 ) -> Result<LaunchDescriptor> {
-    if rules.ar.external_rccl {
+    if uses_rccl(rules, s.n_elem.saturating_mul(s.elem_bytes)) {
         if dtype.name() != "bf16" || s.elem_bytes != 2 || s.world_size != 2 {
             return Err(Error::Rule(
                 "RCCL compatibility currently requires TP=2 BF16 collectives".into(),
@@ -3811,7 +3858,7 @@ fn ar_exact(
     let kernel = ar_kernel(rules, &sym.symbol, nbytes)?;
     Ok(LaunchDescriptor {
         op: "allreduce_exact".into(),
-        plugin: plugin_for(&kernel)?.into(),
+        plugin: collective_plugin(&kernel, rules)?.into(),
         kernel,
         grid: [nb, 1, 1],
         block: [rules.ar_threads_exact(), 1, 1],
@@ -3879,7 +3926,7 @@ fn ar_exact_nq(s: ArNqShape, reg: &Registry<'_>, rules: &SaberRules) -> Result<L
     let kernel = ar_kernel(rules, &sym.symbol, msg.n_elem * msg.elem_bytes)?;
     Ok(LaunchDescriptor {
         op: "allreduce_exact_nq".into(),
-        plugin: plugin_for(&kernel)?.into(),
+        plugin: collective_plugin(&kernel, rules)?.into(),
         kernel,
         // ONE BLOCK PER ROW: the grid is the row count, not a block-count heuristic, because the
         // epilogue's RMS needs the whole row in one workgroup.
@@ -3990,7 +4037,7 @@ fn ar_wht(
     let kernel = ar_kernel(rules, body, scale_off + u64::from(n_groups) * 2)?;
     Ok(LaunchDescriptor {
         op: "allreduce_wht".into(),
-        plugin: plugin_for(&kernel)?.into(),
+        plugin: collective_plugin(&kernel, rules)?.into(),
         kernel,
         grid: [nb, 1, 1],
         block: [nt, 1, 1],

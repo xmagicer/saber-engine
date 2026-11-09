@@ -13,6 +13,9 @@ defaults; see "One card (TP=1)" below.
 
 For TP=2 hosts without GPU peer access, see the opt-in [RCCL compatibility profile](docs/RCCL-COMPAT.md).
 It uses shared host memory and preserves the native P2P backend as the default.
+An [experimental native host-memory backend](docs/HOST-COLLECTIVES.md) retains
+more decode fusions; its validation scope and measured tradeoffs are documented separately.
+中文部署步骤与对比见[双 R9700 无 P2P 部署](docs/HOST-COLLECTIVES.zh-CN.md)。
 
 ## What you need
 

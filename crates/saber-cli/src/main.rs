@@ -2184,12 +2184,10 @@ enum Cmd {
         #[arg(long, default_value = "walk", value_parser = ["walk", "explen"])]
         engine_selector_rank: String,
 
-        /// --engine real (P27-15c): the verify's row form -- `ancestor9` (the best-first 9-node
-        /// ancestor-mask tree; THE DEFAULT since P27-W2-4, the user's flip 10-22) or `off` (today's
-        /// chain of 7; the control). A form the boot cannot run is REFUSED BY NAME and runs `off`
-        /// (`spectree` boot line); today the 10-row tree verify form is not built, so `ancestor9`
-        /// runs the chain and builds the tree plans from the proposal's lattice (counted)
-        #[arg(long, default_value = "ancestor9", value_parser = ["off", "ancestor9"])]
+        /// --engine real: `ancestor9` (default, root + 9 candidates), `best16` (root + 15
+        /// candidates using the existing 6-wave attention/tree objects, requires max-seqs=1),
+        /// or `off` (the chain). The ordinary decode width limit is unchanged.
+        #[arg(long, default_value = "ancestor9", value_parser = ["off", "ancestor9", "best16"])]
         engine_spec_tree: String,
 
         /// --engine real (P27-W2-3): the SAMPLED tree acceptance law -- `off` (the default: a
@@ -2322,6 +2320,19 @@ enum Cmd {
         /// Explicit RCCL compatibility transport (TP=2, host-capable collectives).
         #[arg(long)]
         engine_rccl_lib: Option<String>,
+
+        /// Native exact collectives over shared host pages (TP=2, no P2P).
+        /// With --engine-rccl-lib, messages larger than 64 target rows use RCCL.
+        #[arg(long)]
+        engine_host_ar: bool,
+
+        /// Diagnostic target-feature export (single sequence, prefix caching off; no performance figures).
+        #[arg(long)]
+        engine_draft_capture_dir: Option<PathBuf>,
+
+        /// Independent capture layers in checkpoint order (five comma-separated ids).
+        #[arg(long, value_delimiter = ',', requires = "engine_draft_capture_dir")]
+        engine_draft_capture_layers: Vec<u32>,
 
         /// The Saber manifest, resolved exactly as `saber explain` resolves it
         #[arg(long, default_value = "examples/qwen38-27b-nvfp4-tp2.toml")]
@@ -3124,6 +3135,11 @@ enum Cmd {
         #[arg(long)]
         rccl_lib: Option<String>,
 
+        /// Native exact collectives over shared host pages (TP=2, no P2P).
+        /// With --rccl-lib, messages larger than 64 target rows use RCCL.
+        #[arg(long)]
+        host_ar: bool,
+
         /// The Flash-Next path's flags (FN12): used only when the pack's manifest names
         /// `qwen4_exp`; a 27B pack refuses any of them off its default.
         #[command(flatten)]
@@ -3462,6 +3478,14 @@ enum Cmd {
         /// Explicit RCCL compatibility transport (TP=2, host-capable collectives).
         #[arg(long)]
         rccl_lib: Option<String>,
+
+        /// Native exact collectives over shared host pages (TP=2, no P2P).
+        /// With --rccl-lib, messages larger than 64 target rows use RCCL.
+        #[arg(long)]
+        host_ar: bool,
+        /// Independent auxiliary capture plane; rank zero owns the output directory.
+        #[arg(long, value_delimiter = ',')]
+        draft_capture_layers: Vec<u32>,
     },
 
     /// The P0 autotune sweep: measure every untuned route and write the cache
@@ -4921,6 +4945,9 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
             engine_deadline_s,
             hip_lib,
             engine_rccl_lib,
+            engine_host_ar,
+            engine_draft_capture_dir,
+            engine_draft_capture_layers,
             manifest,
             prebuilt,
             autotune,
@@ -4980,6 +5007,16 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
                          replay arm (P27-W2-5)"
                     );
                 }
+                if engine_spec_tree == "best16" && engine_max_seqs != 1 {
+                    anyhow::bail!("--engine-spec-tree best16 currently requires --engine-max-seqs 1: its chain-after-tree flush is not implemented");
+                }
+                if engine_draft_capture_dir.is_some()
+                    && (enable_prefix_caching != "off"
+                        || engine_spec_tree != "off"
+                        || engine_max_seqs != 1)
+                {
+                    anyhow::bail!("target feature capture requires --enable-prefix-caching off, --engine-spec-tree off and --engine-max-seqs 1");
+                }
                 let Some(pack) = pack else {
                     anyhow::bail!(
                         "--engine real needs --pack <device-final pack>; build one with \
@@ -5023,6 +5060,9 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
                         prebuilt,
                         hip_lib,
                         rccl_lib: engine_rccl_lib,
+                        host_ar: engine_host_ar,
+                        draft_capture_dir: engine_draft_capture_dir,
+                        draft_capture_layers: engine_draft_capture_layers,
                         device: engine_device,
                         budget_mib: engine_budget_mib,
                         max_seqs: engine_max_seqs,
@@ -5437,6 +5477,7 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
             deadline_s,
             hip_lib,
             rccl_lib,
+            host_ar,
             fnx,
         } => {
             // FN12, the model selection law: the pack's manifest decides the path. A Flash-Next
@@ -5485,6 +5526,9 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
                     prebuilt,
                     hip_lib,
                     rccl_lib: rccl_lib,
+                    host_ar,
+                    draft_capture_dir: None,
+                    draft_capture_layers: Vec::new(),
                     device,
                     budget_mib,
                     max_seqs,
@@ -5729,6 +5773,8 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
             hip_lib,
 
             rccl_lib,
+            host_ar,
+            draft_capture_layers,
         } => engine::worker(&engine::WorkerArgs {
             engine: engine::EngineArgs {
                 vision_max_patches,
@@ -5745,6 +5791,9 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
                 prebuilt,
                 hip_lib,
                 rccl_lib: rccl_lib,
+                host_ar,
+                draft_capture_dir: None,
+                draft_capture_layers,
                 device,
                 budget_mib,
                 max_seqs,
@@ -6646,8 +6695,10 @@ mod prod_argv_tests {
             let src = include_str!("main.rs");
             let src = src.split("#[cfg(test)]").next().unwrap_or(src);
             assert_eq!(
-                src.matches(r#"default_value = "ancestor9", value_parser = ["off", "ancestor9"]"#)
-                    .count(),
+                src.matches(
+                    r#"default_value = "ancestor9", value_parser = ["off", "ancestor9", "best16"]"#
+                )
+                .count(),
                 1,
                 "serve defaults to the tree"
             );
@@ -7028,5 +7079,61 @@ fn mixed_prefill_of(
              `fused` (C9, one chunk a forward), `serial` (C4, bit-exact) and `off` (the unmixed \
              schedule, the control)"
         ),
+    }
+}
+
+#[cfg(test)]
+mod best16_serve_tests {
+    use clap::Parser;
+    #[test]
+    fn serve_exposes_the_implemented_sixteen_row_tree() {
+        let form = std::thread::Builder::new()
+            .stack_size(32 << 20)
+            .spawn(|| {
+                match crate::Cli::try_parse_from(["saber", "serve", "--engine-spec-tree", "best16"])
+                    .expect("implemented tree accepted by serve CLI")
+                    .cmd
+                {
+                    crate::Cmd::Serve {
+                        engine_spec_tree, ..
+                    } => engine_spec_tree,
+                    _ => panic!("serve command"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(form, "best16");
+    }
+
+    #[test]
+    fn host_and_rccl_flags_expose_the_explicit_hybrid_profile() {
+        std::thread::Builder::new()
+            .stack_size(32 << 20)
+            .spawn(|| {
+                match crate::Cli::try_parse_from([
+                    "saber",
+                    "serve",
+                    "--engine-host-ar",
+                    "--engine-rccl-lib",
+                    "/runtime/librccl.so",
+                ])
+                .expect("hybrid transport accepted")
+                .cmd
+                {
+                    crate::Cmd::Serve {
+                        engine_host_ar,
+                        engine_rccl_lib,
+                        ..
+                    } => {
+                        assert!(engine_host_ar);
+                        assert_eq!(engine_rccl_lib.as_deref(), Some("/runtime/librccl.so"));
+                    }
+                    _ => panic!("serve command"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
