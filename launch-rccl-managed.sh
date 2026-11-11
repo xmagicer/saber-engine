@@ -5,7 +5,7 @@ export SABER_CONTAINER=docker
 export GPU_MAX_HW_QUEUES=1
 export TIER=qwen38-27b-quark-matched-core-fp8head
 export DRAFT=qwen38-dflash2-tandem-b16-fp8head
-export SABER_BIN=.cache/target-container/release/saber-verified-f07dabc9aa43
+export SABER_BIN=.cache/target-container/release/saber-merged-rccl-6159b4a7cef0
 export SABER_IMAGE=stilldeadcode/vllm-radiance@sha256:45694209177a55a1ab3ba6702fe6e978b1b66a6e66ae3fc066f8d579f7bc4c25
 export SABER_PACKS=/home/dev/models/saber-packs
 export SABER_SHARED=/home/dev/.cache/saber-rccl-runtime
@@ -15,7 +15,7 @@ cleanup(){ docker stop -t 60 "$CNAME" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
-tools/serve_27b.sh --tp 2 --no-build --enable-prefix-caching on --engine-host-ar --engine-draft-full-vocab
+tools/serve_27b.sh --tp 2 --no-build --enable-prefix-caching on --engine-host-ar
 rc="$(docker wait "$CNAME")"
 [[ "$rc" =~ ^[0-9]+$ ]] || exit 1
 exit "$rc"
