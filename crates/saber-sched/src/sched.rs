@@ -195,6 +195,10 @@ pub struct SchedCounters {
     /// Steps that fed a prompt chunk rather than decoding. A prompt of `n` chunks costs `n` of
     /// these before its first token, which is what `TTFT` is made of.
     pub prefill_steps: u64,
+    /// Real prompt rows successfully processed, excluding padding and prefix cache hits.
+    pub prefill_computed_tokens: u64,
+    /// Output tokens committed after stop and length trimming, accumulated after every step.
+    pub output_committed_tokens: u64,
     /// Prompts fed as one decode-shaped step because the plan captured no prefill bucket that
     /// fits them. The pre-P2 path, kept so a manifest without prefill buckets still serves —
     /// and counted, because it is a fallback and a silent one would look like success.
@@ -392,6 +396,18 @@ saber_serve::census_counters!(
             "saber:sched_prefill_steps_total",
             "Steps that fed a prompt chunk.",
             "sched: prefill steps {},"
+        ),
+        (
+            prefill_computed_tokens,
+            "saber:sched_prefill_computed_tokens_total",
+            "Prompt tokens actually computed, excluding cached prefix rows and padding.",
+            "sched: computed prompt tokens {},"
+        ),
+        (
+            output_committed_tokens,
+            "saber:sched_output_committed_tokens_total",
+            "Output tokens committed by the scheduler, including the first sampled token.",
+            "sched: committed output tokens {},"
         ),
         (
             prefill_bucket_misses,
@@ -4254,6 +4270,7 @@ impl Core {
                             }
                         }
                     }
+                    counters.prefill_computed_tokens += u64::from(chunk.prompt_tokens);
                     seq.prefilled += chunk.prompt_tokens as usize;
                     if seq.cuts.contains(&(seq.prefilled as u32)) {
                         prefix_owed.push(slot.seq_id);
@@ -4379,6 +4396,7 @@ impl Core {
                 // step is the one that samples the prompt's first token. `first_step` is what
                 // says so, and it is read before it is cleared.
                 if seq.first_step {
+                    counters.prefill_computed_tokens += slot.input_tokens.len() as u64;
                     sampled_leaders.push((seq.request_id, slot.seq_id));
                 }
                 seq.first_step = false;
@@ -4538,6 +4556,7 @@ impl Core {
             self.requeue_auto_parked(finished);
         }
 
+        self.counters.output_committed_tokens += u64::from(committed_tokens);
         StepSummary {
             step_index: ready.step_index,
             bucket: ready.bucket,
