@@ -13904,11 +13904,19 @@ fn build_drafter(
             },
         );
     }
-    // The batched seed's staging, sized from the frame it packs: one `engine.draft` frame holds
-    // every table of a proposal, and `ctx.positions` is the one that grows - it is replicated per
-    // drafter layer. A megabyte is three orders of magnitude above either and is allocated once.
+    // The seed's staging, sized from the frames it packs: one `engine.draft` frame holds every
+    // table of a proposal once, but `ctx.positions` and `ctx.slots` are REPLICATED per drafter
+    // layer when they are seeded, so one proposal's seed is about `layers` frames' worth. It must
+    // also hold the async candidate re-seed staged past that slice, and the widest batch the
+    // engine can run is `max_seqs`, so the staging is `frame_bytes` scaled by the larger of the
+    // two. A fixed megabyte was enough for the compact frames, not for a whole frame at the
+    // widest decode shape; the floor keeps the small-frame profile unchanged and the ceiling
+    // keeps one pinned allocation bounded.
+    let seed_stage_len = (frame_bytes as u64)
+        .saturating_mul(u64::from(dcfg.layers.max(cfg.max_seqs).max(1)))
+        .clamp(1 << 20, 1 << 26);
     let seed_stage = std::cell::RefCell::new(
-        hip.host_malloc(1 << 20)
+        hip.host_malloc(seed_stage_len)
             .map_err(device_err("the drafter's seed staging"))?,
     );
     // ws-h40: the batched read's staging. The largest read is the selection's two regions,
