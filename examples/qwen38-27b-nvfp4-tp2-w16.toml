@@ -2,13 +2,13 @@
 # Measure this configuration with a separate autotune output file.
 
 [model]
-path = "/mnt/nvme/models/Qwen3.8-27B-NVFP4"
+path = "/models/Qwen3.8-27B-NVFP4"
 tier_id = "tier:qwen38-27b-nvfp4-mxfp4-dflash2-v22.3"
 
 [device]
 target_gfx = "gfx1201"
 # Required, and load-bearing: an autotune record measured uncapped is invalid at the enforced cap.
-# Both cards are held at a FIXED 210 W policy with -75 mV; a MODE1 reset clears it silently.
+# Keep the same cap for every arm; a driver MODE1 reset clears the policy silently.
 power_cap_w = 210
 tp = 2
 

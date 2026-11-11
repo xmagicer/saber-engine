@@ -12,3 +12,8 @@ gpucore*
 *.gpu
 core
 core.*
+
+# Host-specific managed deployment wrappers: keep them out of the tree (the launch recipe is in
+# docs/HOST-COLLECTIVES.md and docs/RCCL-COMPAT.md).
+launch-rccl-managed.sh
+launch-optimized-trial.sh
