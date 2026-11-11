@@ -4,6 +4,10 @@
 set -euo pipefail
 src=$1; out=$2; shift 2
 REPO=$(cd "$(dirname "$0")/.." && pwd)
+# An explicit compiler path lets saber-kbuild run inside an already isolated build container.
+if [ -n "${SABER_HIPCC:-}" ]; then
+  exec "$SABER_HIPCC" --genco --offload-arch=gfx1201 -O3 "$@" "$src" -o "$out"
+fi
 . "$REPO/tools/lib/container.sh"
 IMG=${SABER_IMAGE:-localhost/saber-dev:latest}
 # A WORKTREE'S `.cache` IS A SYMLINK, and a container has to be told what it points at.

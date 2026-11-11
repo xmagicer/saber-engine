@@ -232,5 +232,4 @@ mod tests {
         assert!(msg.contains("mxfp4_wperm_merged"), "{msg}");
         check("x", LayoutId::Raw.id(), LayoutId::Raw).expect("the matching case passes");
     }
-
 }

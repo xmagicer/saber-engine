@@ -219,6 +219,7 @@ type FnModuleLaunchKernel = unsafe extern "C" fn(
 type FnStreamBeginCapture = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type FnStreamEndCapture = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> c_int;
 type FnGraphGetNodes = unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut usize) -> c_int;
+type FnGraphNodeGetType = unsafe extern "C" fn(*mut c_void, *mut c_int) -> c_int;
 type FnGraphInstantiate = unsafe extern "C" fn(
     *mut *mut c_void, // pGraphExec
     *mut c_void,      // graph
@@ -324,6 +325,7 @@ pub(crate) struct Lib {
     stream_begin_capture: FnStreamBeginCapture,
     stream_end_capture: FnStreamEndCapture,
     graph_get_nodes: FnGraphGetNodes,
+    graph_node_get_type: FnGraphNodeGetType,
     graph_instantiate: FnGraphInstantiate,
     graph_launch: FnGraphLaunch,
     graph_exec_destroy: FnPtrIn,
@@ -427,6 +429,7 @@ impl Lib {
             stream_begin_capture: load!(lib, soname, "hipStreamBeginCapture"),
             stream_end_capture: load!(lib, soname, "hipStreamEndCapture"),
             graph_get_nodes: load!(lib, soname, "hipGraphGetNodes"),
+            graph_node_get_type: load!(lib, soname, "hipGraphNodeGetType"),
             graph_instantiate: load!(lib, soname, "hipGraphInstantiate"),
             graph_launch: load!(lib, soname, "hipGraphLaunch"),
             graph_exec_destroy: load!(lib, soname, "hipGraphExecDestroy"),
@@ -1041,6 +1044,36 @@ impl Lib {
             (self.graph_get_nodes)(graph, std::ptr::null_mut(), &mut n)
         })?;
         Ok(n)
+    }
+
+    /// Enumerate graph node kinds without launching or changing the graph.
+    /// # Safety
+    /// `graph` must remain alive and unmodified for the duration of this call.
+    pub(crate) unsafe fn graph_node_types(
+        &self,
+        ctx: &Ctx,
+        graph: *mut c_void,
+    ) -> Result<Vec<i32>> {
+        let mut count = unsafe { self.graph_get_node_count(ctx, graph) }?;
+        let mut nodes = vec![std::ptr::null_mut(); count];
+        self.check("hipGraphGetNodes", unsafe {
+            (self.graph_get_nodes)(graph, nodes.as_mut_ptr(), &mut count)
+        })?;
+        if count != nodes.len() {
+            return Err(Error::Invalid(
+                "Graph node count changed during enumeration".into(),
+            ));
+        }
+        nodes
+            .into_iter()
+            .map(|node| {
+                let mut kind = -1;
+                self.check("hipGraphNodeGetType", unsafe {
+                    (self.graph_node_get_type)(node, &mut kind)
+                })?;
+                Ok(kind)
+            })
+            .collect()
     }
 
     pub(crate) unsafe fn graph_instantiate(

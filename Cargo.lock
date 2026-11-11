@@ -1384,6 +1384,7 @@ dependencies = [
  "saber-sched",
  "saber-serve",
  "saber-vision-input",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

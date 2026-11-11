@@ -85,9 +85,8 @@ fn explain_prints_everything_a_reader_needs() {
     assert!(
         text.contains("variant 12 (split_k=4, tm=4)   31.20 us   margin +4.2% over the runner-up")
     );
-    assert!(
-        text.contains("state      default (who=maintainer when=2026-09-15 harness=bench_decode_ctx)")
-    );
+    assert!(text
+        .contains("state      default (who=maintainer when=2026-09-15 harness=bench_decode_ctx)"));
     assert!(text.contains("capture    graph_safe=yes may_sync=no   launches 2 each, 128 per step"));
     assert!(
         text.contains("workspace  scratch              3.12 MiB  \"split-K partials\""),

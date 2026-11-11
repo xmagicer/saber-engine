@@ -577,7 +577,9 @@ impl Registry {
             return self.policy_digest.clone();
         }
         let mut want: BTreeMap<&str, &str> = BTreeMap::new();
-        for plugin in plugins {
+        for plugin in plugins.into_iter().flat_map(|head| {
+            std::iter::once(head).chain(saber_kernels::companion_plugins(head).iter().copied())
+        }) {
             match saber_kernels::rule_table_for_plugin(plugin) {
                 Some(file) => {
                     if let Some((k, v)) = self.policy_tables.get_key_value(file) {

@@ -79,12 +79,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// to the plan input hash, and every record went on binding the variant the old policy chose. The
 /// list is now derived from the directory by a test rather than by memory (docs/LEDGER.md, I17).
 #[must_use]
-pub fn committed_rule_tables() -> [(&'static str, &'static str); 11] {
+pub fn committed_rule_tables() -> [(&'static str, &'static str); 12] {
     [
         ("mxfp4_gfx1201.toml", rules::PROD_RULES_TEXT),
         ("saber_gfx1201.toml", saber::PROD_RULES_TEXT),
         // C2's ragged decode attention, its own table so its edits re-key only its own route.
         ("saber_ragged_gfx1201.toml", saber::RAGGED_RULES_TEXT),
+        ("saber_uniform16_gfx1201.toml", saber::UNIFORM16_RULES_TEXT),
         ("paro_gfx1201.toml", paro::PROD_RULES_TEXT),
         ("head_gfx1201.toml", head::PROD_RULES_TEXT),
         ("noop_gfx1201.toml", noop::PROD_RULES_TEXT),
@@ -235,9 +236,8 @@ pub fn rule_table_for_plugin(plugin: &str) -> Option<&'static str> {
         // P27-15: the 27B's ancestor-mask tree verify (the WY GDN tree update + advance, the
         // ancestor-word decode attention). No policy row binds them: the tree arm names them.
         "p27_tree_gdn" | "p27_tree_attn" | "p27_tree_conv" | "p27_tree_kv" | "p27_tree_flush"
-        | "p27_tree_gdn16" | "p27_tree_attn16" | "p27_tree_rows" | "p27_tree_advl" => {
-            "noop_gfx1201.toml"
-        }
+        | "p27_tree_gdn16" | "p27_tree_attn16" | "p27_tree_rows" | "p27_tree_advl"
+        | "p27_tree_advl16" => "noop_gfx1201.toml",
         // P27-W2-5: the GDN decode update as base + stash + replay. No policy row binds it: the
         // `--engine-gdn-replay` arm names it.
         "p27w2_gdn_replay" => "noop_gfx1201.toml",
@@ -256,6 +256,7 @@ pub fn rule_table_for_plugin(plugin: &str) -> Option<&'static str> {
         "saber_device_row_stage" => "noop_gfx1201.toml",
         p if p.starts_with("mxfp4_") => "mxfp4_gfx1201.toml",
         "saber_attn_ragged" => "saber_ragged_gfx1201.toml",
+        "saber_attn16" => "saber_uniform16_gfx1201.toml",
         p if p.starts_with("saber_") => "saber_gfx1201.toml",
         p if p.starts_with("dflash_") => "dflash_gfx1201.toml",
         // CMP27F: the fp8 head's one-pass 64-row tile is a route of the dflash head rules
@@ -265,11 +266,37 @@ pub fn rule_table_for_plugin(plugin: &str) -> Option<&'static str> {
     })
 }
 
+/// Additional executable objects needed by a registry entry's head object.
+pub fn companion_plugins(plugin: &str) -> &'static [&'static str] {
+    match plugin {
+        // The W16 head writes partials for the uniform combine in saber_attn.
+        "saber_attn16" => &["saber_attn"],
+        _ => &[],
+    }
+}
+
 pub mod prebuilt {
     use super::PathBuf;
 
     /// Every committed plugin, with one kernel name per plugin used as a smoke sample in tests.
     pub const ALL: &[(&str, &str)] = &[
+        // Bounded exact shared-host transports; native P2P objects retain their own entries.
+        (
+            "saber_ar_host_exact.hsaco",
+            "saber_ar_oneshot_2rank_exact_bf16",
+        ),
+        (
+            "saber_ar_host_exact_chk.hsaco",
+            "saber_ar_oneshot_2rank_exact_bf16_chk",
+        ),
+        (
+            "mxfp4_gemm_decode_host_arnq.hsaco",
+            "mxfp4_gemm_decode_arnq_bk128_ks4_tm1_wperm1_nt1",
+        ),
+        (
+            "mxfp4_gemm_decode_host_arnq_chk.hsaco",
+            "mxfp4_gemm_decode_arnq_bk128_ks4_tm1_wperm1_nt1_chk",
+        ),
         (
             "mxfp4_gemm_decode.hsaco",
             "mxfp4_gemm_decode_bk128_ks4_tm1_wperm1_nt1",
@@ -290,6 +317,10 @@ pub mod prebuilt {
         (
             "saber_attn.hsaco",
             "saber_attn_prefill_h256_gqa6_fp8kv_qk8pv8",
+        ),
+        (
+            "saber_attn16.hsaco",
+            "saber_attn_decode_uniform16_h256_gqa6_fp8kv_nw6",
         ),
         // The RAGGED decode attention (workstream C2): rx6's decode kernel and combine with each
         // sequence's query length read from `cu_q` (the retired source generator RAGGED_SUBS). Its
@@ -719,6 +750,10 @@ pub mod prebuilt {
         (
             "p27_tree_advl.hsaco",
             "p27_gdn_tree_advance_layers_f16s_k128_v128",
+        ),
+        (
+            "p27_tree_advl16.hsaco",
+            "p27_gdn_tree_advance_layers_t16_f16s_k128_v128",
         ),
         // E4-3 (the 16-row tree form): the 16-row tree objects -- the WY GDN tree at TG_TM 16 and
         // the anc decode body at 6 warps (96 rows = 16 x GQA 6). Their own objects: the 10-row

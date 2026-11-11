@@ -2142,11 +2142,8 @@ impl Graph {
     /// asks for the WIDER one and plans both buckets under it, exactly as `1,5` does today.
     ///
     /// # Errors
-    /// A width of 0, and a width the attention kernel cannot hold: the decode route's workgroup
-    /// covers `attn_max_decode_rows` of `q_len * gqa`, so the cap is `64 / 6 = 10` here. That
-    /// bound is READ from the committed saber rules rather than restated, because it is the same
-    /// number `saber::resolve` refuses on — and being refused at graph build is a message, while
-    /// being refused at plan time is a message 64 layers into a boot.
+    /// A zero width, or a width beyond the narrow workgroup without a matching
+    /// uniform decode row in the kernel registry.
     pub fn qwen38_27b_at_width(
         config: ModelConfig,
         tp: u32,
@@ -2365,18 +2362,39 @@ impl Graph {
             .map_err(|e| ModelError::Config(format!("saber rules: {e}")))?;
         let glue =
             GlueRules::prod().map_err(|e| ModelError::Config(format!("attn_glue rules: {e}")))?;
-        let max_width = saber.knobs.attn_max_decode_rows / config.gqa().max(1);
-        if verify_width > max_width {
-            return Err(ModelError::Config(format!(
-                "a verify width of {verify_width} (SPEC={}) needs {} attention row(s) per \
-                 workgroup at GQA {}, and `rules/saber_gfx1201.toml` states \
-                 attn_max_decode_rows = {}: this model tops out at width {max_width} (SPEC={})",
-                verify_width - 1,
-                verify_width * config.gqa().max(1),
-                config.gqa(),
-                saber.knobs.attn_max_decode_rows,
-                max_width - 1,
-            )));
+        if config.num_key_value_heads == 0
+            || config.num_attention_heads % config.num_key_value_heads != 0
+        {
+            return Err(ModelError::Config(
+                "attention heads must be a whole multiple of nonzero KV heads".into(),
+            ));
+        }
+        let gqa = config.gqa();
+        let narrow_width = saber.knobs.attn_max_decode_rows / gqa.max(1);
+        if verify_width > narrow_width || verify_width > MAX_DECODE_QLEN {
+            // Admit a wider graph only when the kernel registry actually has a uniform
+            // causal entry for its width, dtype and head geometry. Strides and scratch
+            // remain per-call checks in the launch descriptor.
+            let geometry = saber::Geometry::new()
+                .num("q_len", i64::from(verify_width))
+                .num("head_dim", i64::from(config.head_dim))
+                .num("gqa", i64::from(gqa))
+                .num("block_size", 16)
+                .num("causal", 1)
+                .dtype("q_dtype", "bf16")
+                .dtype(
+                    "kv_dtype",
+                    if config.kv_cache_fp8 {
+                        "fp8_e4m3"
+                    } else {
+                        "bf16"
+                    },
+                );
+            Registry::new(&saber).select(KernelOp::AttnDecodePaged.id(), &geometry)
+                .map_err(|why| ModelError::Config(format!(
+                    "verify width {verify_width} (SPEC={}) exceeds the narrow attn_max_decode_rows = {} at GQA {gqa}; no uniform decode kernel matches: {why}",
+                    verify_width - 1, saber.knobs.attn_max_decode_rows,
+                )))?;
         }
         let d = Dims::new(&config, tp, &saber, verify_width)?;
         let mut ops = Vec::new();
@@ -2691,19 +2709,22 @@ impl Graph {
             | KernelOp::GdnKktSolve
             | KernelOp::GdnChunkScan
             | KernelOp::AllReduce => {
-                // `q_len > MAX_DECODE_QLEN` is not a refusal to route around: the backend cuts
-                // that run to the PREFILL kernel, so ask the registry the question it answers
-                // (the kernel inventory doc §3.1, `_plan()`).
-                let op_id = if op.kernel == KernelOp::AttnDecodePaged
-                    && keys.num("q_len").unwrap_or(1) > i64::from(MAX_DECODE_QLEN)
-                {
-                    KernelOp::AttnPrefillPaged.id()
-                } else if op.kernel == KernelOp::AttnDecodePaged && keys.num("ragged") == Some(1) {
-                    // A decode ROW BAND (C2): the ragged pair's own registry op.
-                    saber::ATTN_DECODE_RAGGED_OP
-                } else {
-                    op.kernel.id()
-                };
+                let op_id =
+                    if op.kernel == KernelOp::AttnDecodePaged && keys.num("ragged") == Some(1) {
+                        saber::ATTN_DECODE_RAGGED_OP
+                    } else if op.kernel == KernelOp::AttnDecodePaged
+                        && keys.num("q_len").unwrap_or(1) > i64::from(MAX_DECODE_QLEN)
+                    {
+                        // A separately compiled wider decode tile takes priority over the
+                        // inventory's prefill fallback for otherwise unsupported rectangles.
+                        let decode = Route::from_registry(op.kernel.id(), keys, reg);
+                        if decode.refusal.is_none() {
+                            return decode;
+                        }
+                        KernelOp::AttnPrefillPaged.id()
+                    } else {
+                        op.kernel.id()
+                    };
                 Route::from_registry(op_id, keys, reg)
             }
             // ---- P27-15d: the tree form's twins are asked as their PARENTS (the registry holds
@@ -6683,17 +6704,12 @@ mod tests {
         );
     }
 
-    /// NEGATIVE CONTROL for the width: 0 is not a step, and a width the attention workgroup cannot
-    /// hold is refused **at graph build** rather than 64 layers into a boot.
-    ///
-    /// The cap is read from the committed saber rules (`attn_max_decode_rows / gqa` = 64 / 6 =
-    /// 10), which is the same bound `saber::resolve` refuses on — so this control fails for the
-    /// reason the kernel would, not for a number written down twice.
+    /// Narrow and dedicated wide decode tiles have separate width ranges.
     #[test]
     fn a_verify_width_the_attention_cannot_hold_is_refused() {
         let cfg = ModelConfig::qwen38_27b();
         assert!(Graph::qwen38_27b_at_width(cfg.clone(), 1, 0).is_err());
-        // The largest legal one builds, and one past it does not.
+        // The widest narrow tile builds. Its immediate successor has no registered tile.
         let cap = SaberRules::prod_saber()
             .expect("rules")
             .knobs
@@ -6709,6 +6725,26 @@ mod tests {
             text.contains("SPEC="),
             "the message names the SPEC it was asked for: {text}"
         );
+        for fp8 in [true, false] {
+            let mut wide = cfg.clone();
+            wide.kv_cache_fp8 = fp8;
+            let graph = Graph::qwen38_27b_at_width(wide, 2, 16).expect("uniform 16-query kernel");
+            let decode = graph.ops_for(Bucket::Decode {
+                batch: 1,
+                verify_width: 16,
+            });
+            let attn = decode
+                .iter()
+                .find(|r| r.op.kernel == KernelOp::AttnDecodePaged)
+                .unwrap();
+            assert_eq!(attn.plugin, Some("saber_attn16"));
+        }
+        for width in [12, 15, 17] {
+            assert!(Graph::qwen38_27b_at_width(cfg.clone(), 2, width).is_err());
+        }
+        let mut wrong = cfg.clone();
+        wrong.head_dim = 128;
+        assert!(Graph::qwen38_27b_at_width(wrong, 2, 16).is_err());
         // And SPEC=7 — prod's own — is inside it.
         assert!(Graph::qwen38_27b_at_width(cfg, 1, 8).is_ok());
     }

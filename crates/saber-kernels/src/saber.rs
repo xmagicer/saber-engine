@@ -111,6 +111,16 @@ pub struct Gdn {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Ar {
+    /// Explicit runtime backend choice; native rule files keep their existing semantics.
+    #[serde(skip)]
+    pub external_rccl: bool,
+    /// With a host-mapped backend, smaller messages retain native fused kernels.
+    /// Zero keeps the all-RCCL compatibility profile's existing behavior.
+    #[serde(skip)]
+    pub external_rccl_min_bytes: u64,
+    /// Exact kernels over registered shared host memory, with short bounded waits.
+    #[serde(skip)]
+    pub host_mapped: bool,
     pub group: u32,
     pub max_blocks: u32,
     pub chunk_groups_even_bits: u32,
@@ -146,6 +156,16 @@ pub struct Ar {
 
 /// CMP27S: the wave-parallel twin of the served wht6 bf16 one-shot (`hip/saber_ar_wht_wpar.hip`).
 pub const AR_WPAR_SYMBOL: &str = "saber_ar_wpar_2rank_wht6_bf16";
+/// Runtime-provided collective implementation, not a HIP code object.
+pub const RCCL_PLUGIN: &str = "saber_rccl";
+
+/// Whether this exact message belongs to the external collective backend.
+#[must_use]
+pub fn uses_rccl(rules: &SaberRules, bytes: u64) -> bool {
+    rules.ar.external_rccl && bytes >= rules.ar.external_rccl_min_bytes
+}
+/// External BF16 sum entry with [`abi::SIG_RCCL_BF16`].
+pub const RCCL_BF16_KERNEL: &str = "nccl_allreduce_bf16";
 /// The served symbol [`AR_WPAR_SYMBOL`] replaces.
 pub const AR_WPAR_SOURCE: &str = "saber_ar_oneshot_2rank_wht6_bf16";
 /// `SABER_WPAR_CPB_MAX`: the LDS word buffer's chunks a block (8 x 32 lanes x 12 words = 12 KiB).
@@ -455,6 +475,16 @@ pub const PROD_RULES_TEXT: &str = PROD_RULES;
 /// per-table policy digest re-keys only the ragged route's records, never an rx6 route's.
 pub const RAGGED_RULES_TEXT: &str = include_str!("../rules/saber_ragged_gfx1201.toml");
 
+/// The separately compiled uniform 16-query head has its own policy digest.
+pub const UNIFORM16_RULES_TEXT: &str = include_str!("../rules/saber_uniform16_gfx1201.toml");
+
+#[derive(Deserialize)]
+struct Uniform16Table {
+    schema_version: u32,
+    registry: Vec<RegistryRow>,
+    attn_decode: Vec<DecodeRow>,
+}
+
 /// The rows `saber_ragged_gfx1201.toml` carries: registry entries under
 /// [`ATTN_DECODE_RAGGED_OP`] and their instantiations.
 #[derive(Debug, Clone, Deserialize)]
@@ -484,6 +514,8 @@ pub fn plugin_for(symbol: &str) -> Result<&'static str> {
     {
         // The ragged pair (C2) BEFORE the uniform attention, whose prefix it shares.
         Ok("saber_attn_ragged")
+    } else if symbol.starts_with("saber_attn_decode_uniform16_") {
+        Ok("saber_attn16")
     } else if symbol.starts_with("saber_attn_") {
         Ok("saber_attn")
     } else if symbol.starts_with("saber_gdn_fused_update_f16s_") {
@@ -535,7 +567,27 @@ impl SaberRules {
     /// The rules the `qwen_prod_nvfp4` unit runs today (reference rx6, TP=2, MAXSEQS=8), plus the
     /// RAGGED decode attention's own table (C2, [`RAGGED_RULES_TEXT`]).
     pub fn prod_saber() -> Result<Self> {
-        Self::from_toml(PROD_RULES)?.with_ragged_toml(RAGGED_RULES_TEXT)
+        let mut rules = Self::from_toml(PROD_RULES)?.with_ragged_toml(RAGGED_RULES_TEXT)?;
+        let wide: Uniform16Table =
+            toml::from_str(UNIFORM16_RULES_TEXT).map_err(|e| Error::Parse(e.to_string()))?;
+        if wide.schema_version != rules.schema_version
+            || wide.registry.iter().any(|row| {
+                row.op != "attn_decode_paged"
+                    || !row
+                        .constraints
+                        .iter()
+                        .any(|c| c.key == "q_len" && c.op == ConstraintOp::Eq && c.ival == 16)
+            })
+            || wide
+                .attn_decode
+                .iter()
+                .any(|row| row.nw != 6 || plugin_for(&row.symbol).ok() != Some("saber_attn16"))
+        {
+            return Err(Error::Rule("invalid uniform16 rules table".into()));
+        }
+        rules.registry.extend(wide.registry);
+        rules.attn_decode.extend(wide.attn_decode);
+        Ok(rules)
     }
 
     /// Merge a ragged-attention table (C2) into these rules: its registry rows (op
@@ -1509,6 +1561,20 @@ pub fn resolve_with(
     }
 }
 
+fn collective_plugin(symbol: &str, rules: &SaberRules) -> Result<&'static str> {
+    let native = plugin_for(symbol)?;
+    if !rules.ar.host_mapped {
+        return Ok(native);
+    }
+    match native {
+        "saber_ar_exact" => Ok("saber_ar_host_exact"),
+        "saber_ar_exact_chk" => Ok("saber_ar_host_exact_chk"),
+        other => Err(Error::Rule(format!(
+            "host collectives require bounded exact kernels, got {other}"
+        ))),
+    }
+}
+
 fn attn_geometry(s: &AttnShape, with_q_len: bool, rules: &SaberRules) -> Result<Geometry> {
     if s.kv_heads == 0 || s.q_heads % s.kv_heads != 0 {
         return Err(Error::Rule(format!(
@@ -1655,6 +1721,34 @@ fn attn_prefill(
     })
 }
 
+/// Both split-KV dispatches bind the same partials, including the uniform 16-query tile.
+fn decode_scratch(s: &AttnShape, rules: &SaberRules, splits: u32) -> Result<WorkspaceReq> {
+    let knobs = &rules.knobs;
+    if s.q_len == 16
+        && s.ragged_rows == 0
+        && (!knobs.combine_partial_f16
+            || knobs.decode_tile != 16
+            || knobs.combine_partial_bytes_per_split != 520
+            || s.num_seqs == 0)
+    {
+        return Err(Error::Rule("attn_decode: uniform16 requires a nonempty batch, 16-key tiles and 520-byte f16 partials".into()));
+    }
+    let need = rules.decode_scratch_bytes(s, splits);
+    let ws = rules.workspace("attn_decode_scratch")?;
+    if need > ws.capacity_bytes {
+        return Err(Error::Rule(format!(
+            "attn_decode: {need} B of split-KV partials exceeds the {} B declared for attn_decode_scratch",
+            ws.capacity_bytes
+        )));
+    }
+    Ok(WorkspaceReq {
+        name: "attn_decode_scratch".into(),
+        kind: ws.kind,
+        bytes: need,
+        zero_once: false,
+    })
+}
+
 fn attn_decode(s: AttnShape, reg: &Registry<'_>, rules: &SaberRules) -> Result<LaunchDescriptor> {
     let g = attn_geometry(&s, true, rules)?;
     let row = reg.select(decode_op(&s), &g).map_err(Error::Rule)?;
@@ -1674,44 +1768,46 @@ fn attn_decode(s: AttnShape, reg: &Registry<'_>, rules: &SaberRules) -> Result<L
     let kn = &rules.knobs;
     let gqa = s.q_heads / s.kv_heads;
     let rows = s.q_len * gqa;
-    // The registry's `q_len <= 10` already covers this at gqa 6; the entry point checks the
-    // product, which is the condition that actually binds, and returns -4 rather than running.
-    if rows > kn.attn_max_decode_rows {
-        return Err(Error::Rule(format!(
-            "attn_decode: q_len {} x gqa {gqa} = {rows} rows exceeds the {} a decode workgroup \
-             holds",
-            s.q_len, kn.attn_max_decode_rows
-        )));
-    }
     let nw = rows.div_ceil(kn.decode_rows_per_warp).max(1);
     let sym = rules
         .attn_decode
         .iter()
         .find(|r| r.entry == row.entry && r.nw == nw)
         .ok_or_else(|| Error::Rule(format!("{}: no nw={nw} instantiation", row.entry)))?;
-    let combine = combine_row(&s, rules)?;
-    let splits = rules.decode_splits(s.max_ctx, s.kv_heads, s.num_seqs, s.splits);
-    let need = rules.decode_scratch_bytes(&s, splits);
-    let ws = rules.workspace("attn_decode_scratch")?;
-    if need > ws.capacity_bytes {
+    let plugin = plugin_for(&sym.symbol)?;
+    if plugin == "saber_attn16" {
+        // This separately compiled object has six waves. Its 96 rows must never be
+        // attributed to the four-wave uniform or ragged objects.
+        let expected_symbol = match s.kv_dtype {
+            KvDtype::Fp8E4m3 => "saber_attn_decode_uniform16_h256_gqa6_fp8kv_nw6",
+            KvDtype::Bf16 => "saber_attn_decode_uniform16_h256_gqa6_bf16kv_nw6",
+        };
+        if sym.symbol != expected_symbol
+            || s.q_len != 16
+            || s.ragged_rows != 0
+            || gqa != 6
+            || nw != 6
+            || s.head_dim != 256
+            || s.block_size != 16
+        {
+            return Err(Error::Rule(
+                "attn_decode: invalid uniform16 geometry".into(),
+            ));
+        }
+    } else if rows > kn.attn_max_decode_rows {
         return Err(Error::Rule(format!(
-            "attn_decode: {need} B of split-KV partials exceeds the {} B declared for \
-             attn_decode_scratch; the buffer is sized once at construction because allocating \
-             during a graph capture is not allowed",
-            ws.capacity_bytes
+            "attn_decode: q_len {} x gqa {gqa} = {rows} rows exceeds the {} a decode workgroup holds",
+            s.q_len, kn.attn_max_decode_rows
         )));
     }
+    let combine = combine_row(&s, rules)?;
+    let splits = rules.decode_splits(s.max_ctx, s.kv_heads, s.num_seqs, s.splits);
+    let workspaces = vec![decode_scratch(&s, rules, splits)?];
     let (args, bytes) = attn_args(&s, splits, None)?;
-    let workspaces = vec![WorkspaceReq {
-        name: "attn_decode_scratch".into(),
-        kind: ws.kind,
-        bytes: need,
-        zero_once: false,
-    }];
     let _ = combine;
     Ok(LaunchDescriptor {
         op: "attn_decode".into(),
-        plugin: plugin_for(&sym.symbol)?.into(),
+        plugin: plugin.into(),
         kernel: sym.symbol.clone(),
         grid: [splits, s.kv_heads, s.num_seqs],
         block: [nw * 32, 1, 1],
@@ -1754,7 +1850,7 @@ pub fn attn_decode_combine(s: AttnShape, rules: &SaberRules) -> Result<LaunchDes
         s.num_seqs * s.q_len * s.q_heads
     };
     let (args, bytes) = attn_args(&s, splits, Some(kn.decode_tile))?;
-    let ws = rules.workspace("attn_decode_scratch")?;
+    let workspaces = vec![decode_scratch(&s, rules, splits)?];
     Ok(LaunchDescriptor {
         op: "attn_decode_combine".into(),
         plugin: plugin_for(&combine.symbol)?.into(),
@@ -1765,12 +1861,7 @@ pub fn attn_decode_combine(s: AttnShape, rules: &SaberRules) -> Result<LaunchDes
         shared_bytes: splits * 4,
         kernarg_bytes: bytes,
         args,
-        workspaces: vec![WorkspaceReq {
-            name: "attn_decode_scratch".into(),
-            kind: ws.kind,
-            bytes: rules.decode_scratch_bytes(&s, splits),
-            zero_once: false,
-        }],
+        workspaces,
         n_launches: 1,
     })
 }
@@ -3134,7 +3225,13 @@ pub fn tree_gdn_advance(s: GdnShape) -> Result<LaunchDescriptor> {
             "gdn_tree_advance: built for the f16 stored state at k128 v128".into(),
         ));
     }
-    let rec = i64::from(TREE_REC_FLOATS);
+    if s.maxq > TREE16_ROWS {
+        return Err(Error::Rule(
+            "gdn_tree_advance: query span exceeds the 16-row record".into(),
+        ));
+    }
+    let wide = s.maxq > TREE_ROWS;
+    let rec = i64::from(tree_rec_floats(if wide { TREE16_ROWS } else { TREE_ROWS }));
     let (args, bytes) = KArgs::new(abi::SIG_P27_GDN_TREE_ADVANCE)
         .buf("state")
         .i64(s.st_slot)
@@ -3148,8 +3245,18 @@ pub fn tree_gdn_advance(s: GdnShape) -> Result<LaunchDescriptor> {
         .finish()?;
     Ok(LaunchDescriptor {
         op: "gdn_tree_advance".into(),
-        plugin: "p27_tree_gdn".into(),
-        kernel: "p27_gdn_tree_advance_f16s_k128_v128".into(),
+        plugin: if wide {
+            "p27_tree_gdn16"
+        } else {
+            "p27_tree_gdn"
+        }
+        .into(),
+        kernel: if wide {
+            "p27_gdn_tree16_advance_f16s_k128_v128"
+        } else {
+            "p27_gdn_tree_advance_f16s_k128_v128"
+        }
+        .into(),
         grid: [s.n_seqs, s.h, 1],
         block: [256, 1, 1],
         shared_bytes: 0,
@@ -3236,7 +3343,7 @@ pub fn tree_conv_commit(
 }
 
 /// **CMP27L ARM: the flush's advance for every GDN layer in ONE launch**
-/// (`p27_gdn_tree_advance_layers_f16s_k128_v128`, `p27_tree_advl.hsaco`): grid (`layers`, heads,
+/// The batched kernel uses the same record layout as its single-layer donor. Grid (`layers`, heads,
 /// 1), `state_base` / `ts_base` = [layers] u64 tables of each layer's state pool and record, the
 /// strides of the per-layer advance `one` ([`tree_gdn_advance_like`]'s; every layer's must agree,
 /// the caller checks); the per-layer launch's bytes.
@@ -3244,18 +3351,36 @@ pub fn tree_conv_commit(
 /// # Errors
 /// `one` is not the per-layer advance, or carries no stride.
 pub fn tree_gdn_advance_layers(one: &LaunchDescriptor, layers: u32) -> Result<LaunchDescriptor> {
-    if one.kernel != "p27_gdn_tree_advance_f16s_k128_v128" {
-        return Err(Error::Rule(format!(
-            "gdn_tree_advance_layers: built from the per-layer advance, not `{}`",
-            one.kernel
-        )));
-    }
+    let (plugin, kernel, rows) = match (one.plugin.as_str(), one.kernel.as_str()) {
+        ("p27_tree_gdn", "p27_gdn_tree_advance_f16s_k128_v128") => (
+            "p27_tree_advl",
+            "p27_gdn_tree_advance_layers_f16s_k128_v128",
+            TREE_ROWS,
+        ),
+        ("p27_tree_gdn16", "p27_gdn_tree16_advance_f16s_k128_v128") => (
+            "p27_tree_advl16",
+            "p27_gdn_tree_advance_layers_t16_f16s_k128_v128",
+            TREE16_ROWS,
+        ),
+        _ => {
+            return Err(Error::Rule(format!(
+                "gdn_tree_advance_layers: unsupported single-layer kernel `{}:{}`",
+                one.plugin, one.kernel
+            )))
+        }
+    };
     let imm = |name: &str| -> Result<i64> {
         match one.arg(name).map(|s| &s.value) {
             Some(ArgValue::I64 { ival } | ArgValue::I32 { ival }) => Ok(*ival),
             _ => Err(Error::Rule(format!("gdn_tree_advance_layers: no `{name}`"))),
         }
     };
+    if imm("ts_head")? != i64::from(tree_rec_floats(rows)) {
+        return Err(Error::Rule(format!(
+            "gdn_tree_advance_layers: {}-row record stride does not match its kernel",
+            rows
+        )));
+    }
     let (args, bytes) = KArgs::new(abi::SIG_P27_GDN_TREE_ADVANCE_LAYERS)
         .buf("state_base")
         .buf("ts_base")
@@ -3269,8 +3394,8 @@ pub fn tree_gdn_advance_layers(one: &LaunchDescriptor, layers: u32) -> Result<La
         .finish()?;
     Ok(LaunchDescriptor {
         op: "gdn_tree_advance_layers".into(),
-        plugin: "p27_tree_advl".into(),
-        kernel: "p27_gdn_tree_advance_layers_f16s_k128_v128".into(),
+        plugin: plugin.into(),
+        kernel: kernel.into(),
         grid: [layers, one.grid[1], 1],
         block: [256, 1, 1],
         shared_bytes: 0,
@@ -3297,12 +3422,16 @@ pub fn tree_gdn_advance_like(update: &LaunchDescriptor) -> Result<LaunchDescript
             ))),
         }
     };
-    if !update.kernel.starts_with("p27_gdn_tree_f16s_k128_v128") {
+    let (plugin, kernel) = if update.kernel.starts_with("p27_gdn_tree16_f16s_k128_v128") {
+        ("p27_tree_gdn16", "p27_gdn_tree16_advance_f16s_k128_v128")
+    } else if update.kernel.starts_with("p27_gdn_tree_f16s_k128_v128") {
+        ("p27_tree_gdn", "p27_gdn_tree_advance_f16s_k128_v128")
+    } else {
         return Err(Error::Rule(format!(
             "gdn_tree_advance: built for the f16 stored state at k128 v128, not `{}`",
             update.kernel
         )));
-    }
+    };
     let (args, bytes) = KArgs::new(abi::SIG_P27_GDN_TREE_ADVANCE)
         .buf("state")
         .i64(imm("st_slot")?)
@@ -3316,8 +3445,8 @@ pub fn tree_gdn_advance_like(update: &LaunchDescriptor) -> Result<LaunchDescript
         .finish()?;
     Ok(LaunchDescriptor {
         op: "gdn_tree_advance".into(),
-        plugin: "p27_tree_gdn".into(),
-        kernel: "p27_gdn_tree_advance_f16s_k128_v128".into(),
+        plugin: plugin.into(),
+        kernel: kernel.into(),
         grid: [1, update.grid[1], 1],
         block: [256, 1, 1],
         shared_bytes: 0,
@@ -3671,6 +3800,9 @@ fn ar_family(
     rules: &SaberRules,
     names: ArNames<'_>,
 ) -> Result<LaunchDescriptor> {
+    if rules.ar.external_rccl || rules.ar.host_mapped {
+        return ar_exact(s, dtype, reg, rules, names);
+    }
     // The size decides the `exact` key; the registry decides the kernel. Same split the reference draws,
     // same two-step rule ref_allreduce.py applies per call.
     match dtype
@@ -3734,6 +3866,33 @@ fn ar_exact(
     rules: &SaberRules,
     names: ArNames<'_>,
 ) -> Result<LaunchDescriptor> {
+    if uses_rccl(rules, s.n_elem.saturating_mul(s.elem_bytes)) {
+        if dtype.name() != "bf16" || s.elem_bytes != 2 || s.world_size != 2 {
+            return Err(Error::Rule(
+                "RCCL compatibility currently requires TP=2 BF16 collectives".into(),
+            ));
+        }
+        ar_message_ok(&s, rules, "allreduce")?;
+        let count = i64::try_from(s.n_elem)
+            .map_err(|_| Error::Rule("RCCL element count overflow".into()))?;
+        let (args, bytes) = KArgs::new(abi::SIG_RCCL_BF16)
+            .buf(names.input)
+            .buf(names.output)
+            .i32(count)
+            .finish()?;
+        return Ok(LaunchDescriptor {
+            op: "allreduce_rccl_bf16".into(),
+            plugin: RCCL_PLUGIN.into(),
+            kernel: RCCL_BF16_KERNEL.into(),
+            grid: [1, 1, 1],
+            block: [1, 1, 1],
+            shared_bytes: 0,
+            kernarg_bytes: bytes,
+            args,
+            workspaces: Vec::new(),
+            n_launches: 1,
+        });
+    }
     let a = &rules.ar;
     let g = Geometry::new()
         .num("world_size", s.world_size as i64)
@@ -3774,7 +3933,7 @@ fn ar_exact(
     let kernel = ar_kernel(rules, &sym.symbol, nbytes)?;
     Ok(LaunchDescriptor {
         op: "allreduce_exact".into(),
-        plugin: plugin_for(&kernel)?.into(),
+        plugin: collective_plugin(&kernel, rules)?.into(),
         kernel,
         grid: [nb, 1, 1],
         block: [rules.ar_threads_exact(), 1, 1],
@@ -3842,7 +4001,7 @@ fn ar_exact_nq(s: ArNqShape, reg: &Registry<'_>, rules: &SaberRules) -> Result<L
     let kernel = ar_kernel(rules, &sym.symbol, msg.n_elem * msg.elem_bytes)?;
     Ok(LaunchDescriptor {
         op: "allreduce_exact_nq".into(),
-        plugin: plugin_for(&kernel)?.into(),
+        plugin: collective_plugin(&kernel, rules)?.into(),
         kernel,
         // ONE BLOCK PER ROW: the grid is the row count, not a block-count heuristic, because the
         // epilogue's RMS needs the whole row in one workgroup.
@@ -3953,7 +4112,7 @@ fn ar_wht(
     let kernel = ar_kernel(rules, body, scale_off + u64::from(n_groups) * 2)?;
     Ok(LaunchDescriptor {
         op: "allreduce_wht".into(),
-        plugin: plugin_for(&kernel)?.into(),
+        plugin: collective_plugin(&kernel, rules)?.into(),
         kernel,
         grid: [nb, 1, 1],
         block: [nt, 1, 1],

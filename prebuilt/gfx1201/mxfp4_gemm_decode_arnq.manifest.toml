@@ -2,11 +2,11 @@ schema_version = 1
 plugin = "mxfp4_gemm_decode_arnq"
 arch = "gfx1201"
 source = "crates/saber-kernels/hip/mxfp4_gemm_decode_arnq.hip"
-source_sha256 = "9bbb2b121fa102b7ce5610631ce10672c97dfffbb8f3897ee58b4f2b8db64aa5"
+source_sha256 = "c2be2b40e3c57aaf5c28e9f91f363975dac45701907d5b5d301b2fa0a11e2cc0"
 flags = "--genco --offload-arch=gfx1201 -O3"
-build_hash = "7b6a888aefb53829bbc2ca619a2f0221db84f55a137427242a180a3fd518c5c5"
+build_hash = "3570e62607b825eb8cc621480eea68604e60fd66bcb9f5f4fb9a9bac5465f558"
 hsaco = "mxfp4_gemm_decode_arnq.hsaco"
-hsaco_sha256 = "a1b2745707a71fa00ac3954dad751f9989b56df0e24c84783931ab810ba9559f"
+hsaco_sha256 = "c4a7c42de62ba97742413f0acc0944f8139396b9d3180661256d48d075aef0ed"
 
 [[kernel]]
 name = "mxfp4_gemm_decode_arnq_bk128_ks2_tm1_wperm1_nt1"
@@ -16,7 +16,7 @@ kernarg_segment_align = 8
 group_segment_fixed_size = 19640
 private_segment_fixed_size = 0
 vgpr_count = 103
-sgpr_count = 58
+sgpr_count = 50
 wavefront_size = 32
 max_flat_workgroup_size = 256
 
@@ -214,7 +214,7 @@ kernarg_segment_align = 8
 group_segment_fixed_size = 19640
 private_segment_fixed_size = 0
 vgpr_count = 103
-sgpr_count = 58
+sgpr_count = 50
 wavefront_size = 32
 max_flat_workgroup_size = 256
 
@@ -412,7 +412,7 @@ kernarg_segment_align = 8
 group_segment_fixed_size = 10424
 private_segment_fixed_size = 0
 vgpr_count = 69
-sgpr_count = 58
+sgpr_count = 50
 wavefront_size = 32
 max_flat_workgroup_size = 256
 

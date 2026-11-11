@@ -320,6 +320,8 @@ fn peer_base_name(name: &str) -> Option<String> {
 
 /// One stream's dispatcher: the workspace arenas, the counters, and the kernarg staging buffer.
 pub struct Launcher {
+    rccl: Option<std::rc::Rc<saber_hip::RcclComm>>,
+    host_ar: bool,
     stream_label: String,
     counters: Arc<LaunchCounters>,
     /// Aliasable slabs, indexed by the order a descriptor asks for them. Index `i` is handed to
@@ -378,6 +380,11 @@ enum IpcRegion {
     },
     /// Opened from the peer's handle. NOT owned: `hipIpcCloseMemHandle` on drop, never `hipFree`.
     Peer { ptr: ImportedPtr },
+    Host {
+        ptr: saber_hip::SharedHost,
+        mine: bool,
+        epoch: u64,
+    },
 }
 
 impl IpcRegion {
@@ -385,6 +392,7 @@ impl IpcRegion {
         match self {
             IpcRegion::Mine { ptr, .. } => ptr.addr(),
             IpcRegion::Peer { ptr } => ptr.addr(),
+            IpcRegion::Host { ptr, .. } => ptr.addr(),
         }
     }
 
@@ -392,7 +400,7 @@ impl IpcRegion {
         match self {
             IpcRegion::Mine { ptr, .. } => ptr.len(),
             // The peer's region is mapped, not owned; its size is the peer's business.
-            IpcRegion::Peer { .. } => 0,
+            IpcRegion::Peer { .. } | IpcRegion::Host { .. } => 0,
         }
     }
 }
@@ -514,6 +522,25 @@ impl Launcher {
                 }
             }
         }
+        drop(read);
+        for (k, r) in &self.ipc {
+            if let IpcRegion::Host {
+                ptr, mine: true, ..
+            } = r
+            {
+                if ptr.len() <= max_bytes {
+                    let mut buf = vec![0u8; ptr.len() as usize];
+                    ctx.hip
+                        .memcpy_d2h_addr_blocking(&mut buf, ptr.addr(), stream)?;
+                    out.push(RestRegion {
+                        label: label("host-ipc", k),
+                        bytes: ptr.len(),
+                        nonzero: buf.chunks(4).filter(|w| w.iter().any(|b| *b != 0)).count() as u64,
+                        digest: fnv1a64(&buf),
+                    });
+                }
+            }
+        }
         Ok(out)
     }
 
@@ -521,6 +548,8 @@ impl Launcher {
     #[must_use]
     pub fn new(label: impl Into<String>, counters: &Arc<LaunchCounters>) -> Self {
         Launcher {
+            rccl: None,
+            host_ar: false,
             stream_label: label.into(),
             counters: Arc::clone(counters),
             scratch: Vec::new(),
@@ -554,6 +583,65 @@ impl Launcher {
     pub fn with_peer(mut self, peer: Arc<RankPeer>) -> Self {
         self.peer = Some(peer);
         self
+    }
+
+    /// Bind the HIP-thread-owned collective implementation selected by the resolved plan.
+    #[must_use]
+    pub fn with_rccl(mut self, comm: std::rc::Rc<saber_hip::RcclComm>) -> Self {
+        self.rccl = Some(comm);
+        self
+    }
+
+    /// Use registered shared host pages for native exact collectives.
+    #[must_use]
+    pub fn with_host_ar(mut self) -> Self {
+        self.host_ar = true;
+        self
+    }
+
+    fn rccl_args(
+        &self,
+        desc: &LaunchDescriptor,
+        args: &ArgBindings,
+    ) -> Result<(DeviceAddr, DeviceAddr, usize)> {
+        use saber_kernels::saber::{RCCL_BF16_KERNEL, RCCL_PLUGIN};
+        if desc.plugin != RCCL_PLUGIN
+            || desc.kernel != RCCL_BF16_KERNEL
+            || desc.op != "allreduce_rccl_bf16"
+            || !desc.workspaces.is_empty()
+            || desc.args.len() != 3
+        {
+            return Err(Error::Refused(
+                "Invalid external RCCL collective descriptor".into(),
+            ));
+        }
+        if self.rccl.is_none() {
+            return Err(Error::Refused(
+                "RCCL descriptor has no initialized communicator".into(),
+            ));
+        }
+        let buffer = |name: &str| -> Result<DeviceAddr> {
+            match desc.arg(name).map(|s| &s.value) {
+                Some(ArgValue::Buffer { buffer }) => args
+                    .get(buffer)
+                    .filter(|a| *a != DeviceAddr::NULL)
+                    .ok_or_else(|| Error::Refused(format!("RCCL buffer {buffer} is unbound"))),
+                _ => Err(Error::Refused(format!(
+                    "RCCL descriptor has no buffer argument {name}"
+                ))),
+            }
+        };
+        let count = match desc.arg("count").map(|s| &s.value) {
+            Some(ArgValue::I32 { ival }) if *ival > 0 => {
+                usize::try_from(*ival).map_err(|_| Error::Refused("RCCL count overflow".into()))?
+            }
+            _ => {
+                return Err(Error::Refused(
+                    "RCCL descriptor has no positive element count".into(),
+                ))
+            }
+        };
+        Ok((buffer("in")?, buffer("out")?, count))
     }
 
     /// The other rank, if this launcher serves a collective.
@@ -677,6 +765,28 @@ impl Launcher {
         args: &ArgBindings,
         stream: &Stream,
     ) -> Result<LaunchReport> {
+        if desc.plugin == saber_kernels::saber::RCCL_PLUGIN {
+            if self.recorder.is_some() {
+                return Err(Error::Refused(
+                    "Dispatch recording cannot replay external RCCL collectives".into(),
+                ));
+            }
+            let (input, output, count) = self.rccl_args(desc, args)?;
+            ctx.hip.rccl_all_reduce_bf16(
+                self.rccl.as_ref().expect("checked above"),
+                input,
+                output,
+                count,
+                stream,
+            )?;
+            self.counters.hit_launched();
+            self.counters.hit_ar_plain();
+            return Ok(LaunchReport {
+                launches: 1,
+                scratch_allocated: 0,
+                persistent_allocated: 0,
+            });
+        }
         let Some((function, decl)) = ctx.functions.get(&desc.plugin, &desc.kernel) else {
             return Err(Error::NotFound(format!(
                 "`{}` has no kernel `{}` loaded (plugin not loaded, or the symbol is not in it)",
@@ -851,6 +961,97 @@ impl Launcher {
             return Ok(region.addr());
         }
 
+        if self.host_ar {
+            if !matches!(
+                desc.plugin.as_str(),
+                "saber_ar_host_exact"
+                    | "saber_ar_host_exact_chk"
+                    | "mxfp4_gemm_decode_host_arnq"
+                    | "mxfp4_gemm_decode_host_arnq_chk"
+            ) {
+                return Err(Error::launch(
+                    &desc.kernel,
+                    "host mapping requires a bounded exact code object",
+                ));
+            }
+            if let Some(base) = peer_base_name(&w.name) {
+                let base_key = self.ipc_key(desc, args, &base);
+                let path = match self.ipc.get(&base_key) {
+                    Some(IpcRegion::Host {
+                        ptr, mine: true, ..
+                    }) => ptr
+                        .path()
+                        .ok_or_else(|| {
+                            Error::launch(
+                                &desc.kernel,
+                                "shared file already unlinked before exchange",
+                            )
+                        })?
+                        .to_path_buf(),
+                    _ => {
+                        return Err(Error::launch(
+                            &desc.kernel,
+                            "shared peer workspace precedes its base",
+                        ))
+                    }
+                };
+                let bytes = path
+                    .to_str()
+                    .ok_or_else(|| Error::launch(&desc.kernel, "non-UTF8 shared file name"))?
+                    .as_bytes();
+                let theirs = peer
+                    .exchange()
+                    .xchg_bytes(&format!("host-ar.{base}"), bytes)?;
+                let theirs = std::str::from_utf8(&theirs)
+                    .map_err(|_| Error::launch(&desc.kernel, "non-UTF8 peer file name"))?;
+                let ptr = ctx
+                    .hip
+                    .shared_host_open(std::path::Path::new(theirs), w.bytes.max(1))?;
+                peer.rendezvous(&format!("host-ar.mapped.{base}"))?;
+                if let Some(IpcRegion::Host { ptr, .. }) = self.ipc.get_mut(&base_key) {
+                    ptr.unlink()?;
+                }
+                let addr = ptr.addr();
+                self.ipc.insert(
+                    key,
+                    IpcRegion::Host {
+                        ptr,
+                        mine: false,
+                        epoch: 0,
+                    },
+                );
+                self.counters.hit_ipc_opened();
+                return Ok(addr);
+            }
+            let exported = desc
+                .workspaces
+                .iter()
+                .any(|o| peer_base_name(&o.name).as_deref() == Some(w.name.as_str()));
+            if exported {
+                let rounded = w.bytes.max(1).div_ceil(4096) * 4096;
+                // Both mappings count against a per-process 1 GiB pinned-page reservation.
+                if self.host_ipc_bytes().saturating_add(2 * rounded) > 1024 * 1024 * 1024 {
+                    return Err(Error::launch(
+                        &desc.kernel,
+                        "host collective pages exceed the reserved 1 GiB cap",
+                    ));
+                }
+                let ptr = ctx.hip.shared_host_create(w.bytes.max(1))?;
+                let addr = ptr.addr();
+                self.ipc.insert(
+                    key,
+                    IpcRegion::Host {
+                        ptr,
+                        mine: true,
+                        epoch: 1,
+                    },
+                );
+                self.counters.hit_ipc_exported();
+                return Ok(addr);
+            }
+            // Sequence counters are local device atomics; only payload and flags use host pages.
+        }
+
         if let Some(base) = peer_base_name(&w.name) {
             // The peer's region. Its handle comes from the exchange, and the base must be a
             // region this descriptor also declares — otherwise the peer has nothing to export.
@@ -976,7 +1177,10 @@ impl Launcher {
                 let epoch = match self.ipc.get(&key) {
                     Some(IpcRegion::Mine { epoch, .. }) => *epoch,
                     // The peer's view has no epoch of its own; the peer accounts for it.
-                    Some(IpcRegion::Peer { .. }) | None => 0,
+                    Some(IpcRegion::Host {
+                        mine: true, epoch, ..
+                    }) => *epoch,
+                    Some(IpcRegion::Peer { .. }) | Some(IpcRegion::Host { .. }) | None => 0,
                 };
                 d.num(epoch);
             }
@@ -993,14 +1197,37 @@ impl Launcher {
     /// rank that did not say so.
     pub fn reset_ipc_state(&mut self, ctx: &LaunchCtx<'_>, stream: &Stream) -> Result<usize> {
         let mut n = 0;
+        ctx.hip.sync_stream(stream)?;
+        if self.host_ar {
+            self.peer
+                .as_ref()
+                .expect("host transport peer")
+                .rendezvous("host-ar.reset-idle")?;
+        }
         for region in self.ipc.values_mut() {
             if let IpcRegion::Mine { ptr, epoch } = region {
                 ctx.hip.memset(ptr, 0, stream)?;
                 *epoch += 1;
                 n += 1;
+            } else if let IpcRegion::Host {
+                ptr,
+                mine: true,
+                epoch,
+            } = region
+            {
+                // Both ranks synchronized their streams and met the reset barrier above.
+                ctx.hip.memset_shared_zero(ptr, stream)?;
+                *epoch += 1;
+                n += 1;
             }
         }
         ctx.hip.sync_stream(stream)?;
+        if self.host_ar {
+            self.peer
+                .as_ref()
+                .expect("host transport peer")
+                .rendezvous("host-ar.reset-done")?;
+        }
         self.counters.hit_ipc_reset();
         Ok(n)
     }
@@ -1019,6 +1246,10 @@ impl Launcher {
         args: &ArgBindings,
         stream: &Stream,
     ) -> Result<()> {
+        if desc.plugin == saber_kernels::saber::RCCL_PLUGIN {
+            self.rccl_args(desc, args)?;
+            return Ok(());
+        }
         let mut report = LaunchReport {
             launches: 0,
             scratch_allocated: 0,
@@ -1106,6 +1337,18 @@ impl Launcher {
     #[must_use]
     pub fn ipc_bytes(&self) -> u64 {
         self.ipc.values().map(IpcRegion::bytes).sum()
+    }
+
+    /// Page-rounded registered host mappings held by this process (both rank views).
+    #[must_use]
+    pub fn host_ipc_bytes(&self) -> u64 {
+        self.ipc
+            .values()
+            .map(|r| match r {
+                IpcRegion::Host { ptr, .. } => ptr.len().div_ceil(4096) * 4096,
+                _ => 0,
+            })
+            .sum()
     }
 
     /// The Persistent regions this launcher owns: `(key, bytes)`, in key order.

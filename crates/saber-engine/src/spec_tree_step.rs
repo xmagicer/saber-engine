@@ -50,7 +50,7 @@ pub struct ArmContext {
     pub tp: u32,
     /// A DFlash2 drafter is booted (`--draft-pack`).
     pub drafter: bool,
-    /// The drafter's block (8 = the anchor + 7: the lattice's 7 positions).
+    /// Query block used by the native DFlash2 proposal.
     pub draft_block: u32,
     /// The selector re-ranks the chain on the host (`--engine-selector-rank explen`).
     pub selector_reranks: bool,
@@ -122,14 +122,24 @@ pub fn resolve_arm(asked: SpecTreeForm, ctx: ArmContext) -> ArmResolution {
             plans: false,
         },
         SpecTreeForm::Ancestor9 | SpecTreeForm::Ancestor9Pair | SpecTreeForm::Best16 => {
-            if !ctx.drafter || ctx.draft_block != 8 {
+            let supports_wide_draft =
+                matches!(asked, SpecTreeForm::Ancestor9 | SpecTreeForm::Best16);
+            let wide = supports_wide_draft && ctx.draft_block == 16;
+            if !ctx.drafter || (ctx.draft_block != 8 && !wide) {
                 return off(
                     format!(
-                        "the tree is built from the DFlash2 selector's lattice: it needs the \
-                         drafter at block 8 (drafter {}, block {})",
+                        "{} requires the DFlash2 drafter at block 8{} (drafter {}, block {})",
+                        asked.as_str(),
+                        if supports_wide_draft { " or 16" } else { "" },
                         if ctx.drafter { "on" } else { "off" },
                         ctx.draft_block
                     ),
+                    false,
+                );
+            }
+            if wide && ctx.max_seqs != 1 {
+                return off(
+                    "the block-16 native tree requires one active sequence".to_owned(),
                     false,
                 );
             }
@@ -555,6 +565,37 @@ pub fn plans_from_read(
         .collect()
 }
 
+/// Native lattice retained from the most recent proposal. In the one-sequence B16
+/// profile the scheduler may ask for exactly the first nine of the fifteen tokens.
+/// Bind that shorter view to the sequence, absolute cursor and anchor that generated it.
+#[derive(Debug)]
+pub(crate) struct NativeTreeOffer {
+    pub(crate) owner: Option<(saber_sched::SeqId, u32, TokenId)>,
+    pub(crate) chain: Vec<TokenId>,
+    pub(crate) plan: TreePlan,
+}
+
+impl NativeTreeOffer {
+    pub(crate) fn for_step(
+        self,
+        seq: saber_sched::SeqId,
+        position: u32,
+        anchor: TokenId,
+        scheduled: &[TokenId],
+        block16: bool,
+    ) -> Option<TreePlan> {
+        let bound = if block16 {
+            self.owner == Some((seq, position, anchor))
+                && self.chain.len() == 15
+                && scheduled.len() + 1 == self.plan.rows()
+                && self.chain.starts_with(scheduled)
+        } else {
+            self.chain == scheduled
+        };
+        bound.then(|| self.plan.with_anchor(i64::from(anchor)))
+    }
+}
+
 /// The lattice plans' counters (`spectree plans ...`): plans built, nodes, the deepest node a
 /// plan, the chain's walk found as a root path (its depth), refusals.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -640,8 +681,17 @@ impl PlanCounts {
 /// # Errors
 /// A draft longer than the drafter's positions.
 pub fn draft_chain_plan(anchor: TokenId, draft: &[TokenId]) -> Result<TreePlan, TreeError> {
+    draft_chain_plan_limited(anchor, draft, crate::spec_tree::DRAFT_POSITIONS)
+}
+
+/// A chain fallback bounded by both the active drafter and the verify tile.
+pub(crate) fn draft_chain_plan_limited(
+    anchor: TokenId,
+    draft: &[TokenId],
+    max_depth: u32,
+) -> Result<TreePlan, TreeError> {
     let cands: Vec<u32> = (0..draft.len() as u32).collect();
-    let tree = crate::spec_tree::SpecTree::chain(&cands)?;
+    let tree = crate::spec_tree::SpecTree::chain_limited(&cands, max_depth)?;
     TreePlan::new(tree, i64::from(anchor), |n| {
         draft.get(n.depth as usize - 1).map_or(0, |t| i64::from(*t))
     })
@@ -792,6 +842,103 @@ mod tests {
             .refused
             .expect("refused")
             .contains("TP=1"));
+    }
+
+    #[test]
+    fn native_block16_uses_all_fifteen_selector_positions_on_best16() {
+        let mut wide = ctx(true);
+        wide.draft_block = 16;
+        let arm = resolve_arm(SpecTreeForm::Best16, wide);
+        assert_eq!(arm.runs, SpecTreeForm::Best16);
+        assert!(arm.plans);
+        assert_eq!(
+            resolve_arm(SpecTreeForm::Ancestor9, wide).runs,
+            SpecTreeForm::Ancestor9
+        );
+        assert!(resolve_arm(SpecTreeForm::Ancestor9Pair, wide).fell_back());
+        wide.max_seqs = 2;
+        assert!(resolve_arm(SpecTreeForm::Best16, wide).fell_back());
+
+        let (steps, k) = (15usize, 16usize);
+        let mut scores = vec![-64.0f32; steps * k * k];
+        let mut expected = vec![900i64];
+        let mut lane = 0;
+        for position in 0..steps {
+            for prev in 0..k {
+                let best = (prev + position + 1) % k;
+                scores[(position * k + prev) * k + best] = 0.0;
+            }
+            lane = (lane + position + 1) % k;
+            expected.push((position * k + lane) as i64);
+        }
+        let scores: Vec<u8> = scores.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let candidates: Vec<u8> = (0..(steps * k) as i64).flat_map(i64::to_le_bytes).collect();
+        let plans = plans_from_read(SpecTreeForm::Best16, &[900], &scores, &candidates, steps, k);
+        let plan = plans[0].as_ref().expect("a full native selector lattice");
+        assert_eq!(plan.tokens(), &expected);
+        assert_eq!(plan.depth(15), 15);
+        assert_eq!(plan.words()[15], u16::MAX);
+
+        let draft: Vec<u32> = expected[1..].iter().map(|id| *id as u32).collect();
+        assert_eq!(
+            draft_chain_plan_limited(900, &draft, 15).unwrap().words(),
+            plan.words()
+        );
+        assert!(draft_chain_plan(900, &draft).is_err());
+    }
+
+    #[test]
+    fn block16_ancestor9_binds_only_its_own_truncated_mailbox_chain() {
+        use crate::draft::{Drafter, EngineDrafter};
+        use saber_sched::SeqId;
+        let seq = SeqId(27);
+        let (k, steps) = (16usize, 15usize);
+        let mut scores = vec![-64f32; steps * k * k];
+        for row in scores.chunks_exact_mut(k) {
+            row[0] = 0.;
+        }
+        let scores: Vec<u8> = scores.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let candidates: Vec<u8> = (0..(k * steps) as i64).flat_map(i64::to_le_bytes).collect();
+        let plan = plans_from_read(
+            SpecTreeForm::Ancestor9,
+            &[0],
+            &scores,
+            &candidates,
+            steps,
+            k,
+        )
+        .pop()
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan.rows(), 10);
+        assert_eq!(plan.words()[9], 0x03ff);
+        let chain: Vec<TokenId> = (0..15).map(|i| i * 16).collect();
+        let offer = || NativeTreeOffer {
+            owner: Some((seq, 128, 41)),
+            chain: chain.clone(),
+            plan: plan.clone(),
+        };
+        let mut mailbox = EngineDrafter::new(9);
+        mailbox.offer(seq, &chain);
+        let scheduled = mailbox.propose(seq, 41, 9);
+        let tree = offer().for_step(seq, 128, 41, &scheduled, true).unwrap();
+        assert_eq!(tree.tokens()[0], 41);
+        assert_eq!(
+            &tree.tokens()[1..],
+            &scheduled.iter().map(|t| *t as i64).collect::<Vec<_>>()
+        );
+        assert!(offer()
+            .for_step(SeqId(28), 128, 41, &scheduled, true)
+            .is_none());
+        assert!(offer().for_step(seq, 129, 41, &scheduled, true).is_none());
+        assert!(offer().for_step(seq, 128, 42, &scheduled, true).is_none());
+        assert!(offer()
+            .for_step(seq, 128, 41, &scheduled[..8], true)
+            .is_none());
+        let mut substituted = scheduled.clone();
+        substituted[8] += 1;
+        assert!(offer().for_step(seq, 128, 41, &substituted, true).is_none());
+        assert!(draft_chain_plan_limited(41, &chain[..10], 9).is_err());
     }
 
     #[test]

@@ -1375,10 +1375,18 @@ pub fn gemm_decode_ar_nq(
     // object, `decode_arnq_chk`), so a checked run never folds a checked reduce into an unchecked
     // GEMM tail.
     let checked = nq.kernel.ends_with(crate::saber::AR_CHECK_SUFFIX);
-    let (plugin, suffix) = if checked {
-        (GEMM_AR_NQ_CHK_PLUGIN, crate::saber::AR_CHECK_SUFFIX)
-    } else {
-        (GEMM_AR_NQ_PLUGIN, "")
+    let host = matches!(
+        nq.plugin.as_str(),
+        "saber_ar_host_exact" | "saber_ar_host_exact_chk"
+    );
+    let (plugin, suffix) = match (host, checked) {
+        (true, true) => (
+            "mxfp4_gemm_decode_host_arnq_chk",
+            crate::saber::AR_CHECK_SUFFIX,
+        ),
+        (true, false) => ("mxfp4_gemm_decode_host_arnq", ""),
+        (false, true) => (GEMM_AR_NQ_CHK_PLUGIN, crate::saber::AR_CHECK_SUFFIX),
+        (false, false) => (GEMM_AR_NQ_PLUGIN, ""),
     };
     Ok(LaunchDescriptor {
         op: "gemm_decode_ar_nq".into(),

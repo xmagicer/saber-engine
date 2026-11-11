@@ -754,6 +754,16 @@ fn enumerate_saber(op: &TuneOp, rules: &SaberRules, symbols: &SymbolIndex) -> Va
             // rows, so the ladder starts at the smallest that covers them; more is legal and is
             // exactly the question worth measuring.
             let need = rows.div_ceil(kn.decode_rows_per_warp).max(1);
+            // Only a head explicitly resolved from the wider object may tune above
+            // the four-wave ladder. The original objects keep their existing limit.
+            let max_nw = if need > kn.decode_max_nw {
+                saber::resolve(saber::Op::AttnDecode, saber::Shape::Attn(s), rules)
+                    .ok()
+                    .filter(|head| head.plugin == "saber_attn16")
+                    .map_or(kn.decode_max_nw, |head| head.block[0] / 32)
+            } else {
+                kn.decode_max_nw
+            };
             let ladder: BTreeSet<u32> = rules.attn_decode.iter().map(|r| r.nw).collect();
             for nw in ladder {
                 if nw < need {
@@ -763,10 +773,10 @@ fn enumerate_saber(op: &TuneOp, rules: &SaberRules, symbols: &SymbolIndex) -> Va
                     ));
                     continue;
                 }
-                if nw > kn.decode_max_nw {
+                if nw > max_nw {
                     set.refused.push(format!(
                         "nw={nw}: past the {} the entry point takes",
-                        kn.decode_max_nw
+                        max_nw
                     ));
                     continue;
                 }
@@ -2894,6 +2904,22 @@ mod tests {
             has_descales: false,
             ragged_rows: 0,
         }
+    }
+
+    #[test]
+    fn uniform16_tunes_the_six_wave_head_and_its_actual_combine() {
+        let s = AttnShape {
+            q_len: 16,
+            live_rows: 16,
+            ..prefill_cell()
+        };
+        let candidates =
+            enumerate_variants(&TuneOp::AttnDecode(s), &rules(), &saber_rules(), &symbols());
+        assert_eq!(
+            kernels(&candidates),
+            ["saber_attn_decode_uniform16_h256_gqa6_fp8kv_nw6"]
+        );
+        assert_eq!(candidates.variants[0].descs[1].plugin, "saber_attn");
     }
 
     /// **NEGATIVE CONTROL for the index-law check**: the I18 bug, rebuilt.

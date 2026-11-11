@@ -50,6 +50,7 @@ case "$TP" in
   *) echo "--tp $TP: the 27B launcher serves TP=2 (two cards) or TP=1 (one card)" >&2; exit 2 ;;
 esac
 PORT=${PORT:-8080}
+HOST=${HOST:-0.0.0.0}
 PACKS=${SABER_PACKS:-/mnt/nvme/saber-packs}
 MODEL=${MODEL:-Qwen3.8}
 PREBUILT=${PREBUILT:-prebuilt/gfx1201}   # CMP27E: a hold's frozen prebuilt dir (a path the container sees: under /work or $SHARED)
@@ -97,6 +98,18 @@ else
   MAX_SEQS=${MAX_SEQS:-4}
   FETCH=27b-tp1
 fi
+# Explicit compatibility profile for hosts without GPU peer access. The runtime image must
+# provide RCCL >= 2.30.4; it need not be installed in the build image. Native P2P is unchanged.
+COLLECTIVE_ARGS=()
+COLLECTIVE_ENV=()
+COLLECTIVE_GPU_QUEUES=3
+if [ -n "${RCCL_LIB:-}" ]; then
+  [ "$TP" = 2 ] || { echo "RCCL_LIB requires TP=2" >&2; exit 2; }
+  # Keep async readbacks on the model queue. Verified A/B/A on the non-P2P R9700 pair.
+  COLLECTIVE_GPU_QUEUES=1
+  COLLECTIVE_ARGS+=(--engine-rccl-lib "$RCCL_LIB")
+  COLLECTIVE_ENV=(-e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=0 -e NCCL_PROTO=Simple)
+fi
 # FN66: `--warm-prompts FILE` -- the file is copied where the container sees it ($OUT) and the
 # launcher reports ready only after the server's `warmprompts done` line.
 ARGS=()
@@ -107,6 +120,13 @@ while [ $# -gt 0 ]; do
     --warm-prompts=*) WARM=${1#*=}; shift ;;
     *) ARGS+=("$1"); shift ;;
   esac
+done
+for arg in "${ARGS[@]}"; do
+  if [ "$arg" = "--engine-host-ar" ]; then
+    [ "$TP" = 2 ] || { echo "--engine-host-ar requires TP=2" >&2; exit 2; }
+    # Registered host transfers share the model queue, like the RCCL profile.
+    COLLECTIVE_GPU_QUEUES=1
+  fi
 done
 if [ -n "$WARM" ]; then
   [ -f "$WARM" ] || { echo "--warm-prompts: no file '$WARM'" >&2; exit 1; }
@@ -161,7 +181,7 @@ SERVE_CMD="$SABER serve --engine real $TP_ARGS \
   --tokenizer /work/.cache/template_corpus.tokenizer.json --chat-template /work/.cache/template_corpus.jinja \
   --engine-max-ctx $MAX_CTX --engine-prefill-rows 96,128,192,256,320,384,512,768,1024,1536,2048 \
   --engine-decode-batches $BATCHES --engine-decode-widths ${WIDTHS:-1,8} --engine-max-seqs $MAX_SEQS --engine-draft-block ${DRAFT_BLOCK:-8} --engine-draft-pack /packs/$DRAFT \
-  --engine-budget-mib ${BUDGET_MIB:-30500} --engine-rectangular-widths --served-model-name $MODEL --host 0.0.0.0 --port $PORT ${ARGS[*]}"
+  --engine-budget-mib ${BUDGET_MIB:-30500} --engine-rectangular-widths --served-model-name $MODEL --host $HOST --port $PORT ${COLLECTIVE_ARGS[*]} ${ARGS[*]}"
 # FN73: a server that exits is reported with ITS exit code (86 = a rank failed: the log's last
 # line is `saber: FATAL rank R: <reason>`), and this script exits with it -- never a masked 1.
 died() {
@@ -178,7 +198,7 @@ $CTR run -d --name "$CNAME" --security-opt label=disable --security-opt seccomp=
   "${CTR_GPU[@]}" "${CTR_USER[@]}" --ipc=host --network=host \
   -v "$REPO":/work -v "$PACKS":/packs:ro -v "$CACHE_REAL":"$CACHE_REAL" -v "$SHARED":"$SHARED" \
   -v "$REPO/.cache/cargo-registry":/opt/rust/cargo/registry -w /work \
-  -e HIP_VISIBLE_DEVICES="$HIP_DEVICES" -e GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-3}" -e CUDA_VISIBLE_DEVICES= -e LD_LIBRARY_PATH=/opt/rocm/lib \
+  "${COLLECTIVE_ENV[@]}" -e HIP_VISIBLE_DEVICES="$HIP_DEVICES" -e GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-$COLLECTIVE_GPU_QUEUES}" -e CUDA_VISIBLE_DEVICES= -e LD_LIBRARY_PATH=/opt/rocm/lib \
   -e CARGO_TARGET_DIR=/work/.cache/target-container --entrypoint /bin/bash "$IMG" \
   -c "ulimit -c 0; exec ${SERVE_PREFIX:-} $SERVE_CMD" >/dev/null || { echo "$CTR run failed" >&2; exit 1; }
 echo "== $(date '+%T') booting $CNAME on :$PORT ($([ "$TP" = 1 ] && echo "TP=1 on HIP device $DEVICE, ")max ctx $MAX_CTX per sequence; the pack loads from NVMe)"

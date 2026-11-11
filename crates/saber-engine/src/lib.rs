@@ -49,6 +49,8 @@ pub mod census;
 pub mod device;
 pub mod device_step;
 pub mod draft;
+pub mod draft_capture;
+mod dspine_socket;
 pub mod draft_inputs;
 pub mod draft_plan;
 pub mod draft_runs;

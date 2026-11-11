@@ -119,6 +119,10 @@ impl SpecTree {
     /// # Errors
     /// [`TreeError::Malformed`] when a parent does not precede its child or depths do not chain.
     pub fn new(nodes: Vec<Node>) -> Result<SpecTree, TreeError> {
+        Self::new_limited(nodes, DRAFT_POSITIONS)
+    }
+
+    fn new_limited(nodes: Vec<Node>, max_depth: u32) -> Result<SpecTree, TreeError> {
         for (i, n) in nodes.iter().enumerate() {
             let want = match n.parent {
                 None => 1,
@@ -129,7 +133,7 @@ impl SpecTree {
                     )))
                 }
             };
-            if n.depth != want || n.depth > DRAFT_POSITIONS {
+            if n.depth != want || n.depth > max_depth {
                 return Err(TreeError::Malformed(format!(
                     "node {i} at depth {} under a parent that puts it at {want}",
                     n.depth
@@ -144,7 +148,11 @@ impl SpecTree {
     /// # Errors
     /// More candidates than the drafter's positions.
     pub fn chain(cands: &[u32]) -> Result<SpecTree, TreeError> {
-        SpecTree::new(
+        Self::chain_limited(cands, DRAFT_POSITIONS)
+    }
+
+    pub(crate) fn chain_limited(cands: &[u32], max_depth: u32) -> Result<SpecTree, TreeError> {
+        Self::new_limited(
             cands
                 .iter()
                 .enumerate()
@@ -154,6 +162,7 @@ impl SpecTree {
                     parent: i.checked_sub(1),
                 })
                 .collect(),
+            max_depth,
         )
     }
 
@@ -396,7 +405,7 @@ pub struct LatticeView<'a> {
     pub cand: &'a [i64],
     /// Edge scores.
     pub scores: &'a [f32],
-    /// Drafted positions (7).
+    /// Drafted positions in this request (block size minus the anchor).
     pub steps: usize,
     /// Candidates a position (16).
     pub k: usize,
@@ -561,7 +570,10 @@ pub fn best_first(
             }
         }
     }
-    SpecTree::new(nodes)
+    // The proposal's actual score table bounds depth. A trained block-8 pack
+    // can also serve a 16-row query; in that case 15 positions were evaluated.
+    let max_depth = lat.steps.min((TREE_MAX_ROWS - 1) as usize) as u32;
+    SpecTree::new_limited(nodes, max_depth)
 }
 
 /// Where one conv window element comes from: a verify row's input, or the committed tail's
@@ -610,6 +622,50 @@ impl TreePlan {
             parent_row,
             depth,
             tokens,
+        })
+    }
+
+    /// Build the external 15-node verifier layout from token IDs and zero-based parent indices.
+    /// Each sibling token must be unique so both TP ranks derive the same accepted path.
+    pub(crate) fn from_external(
+        anchor: u32,
+        entries: &[(Option<usize>, u32)],
+        vocab: u32,
+    ) -> Result<Self, TreeError> {
+        if entries.len() != TREE_MAX_ROWS as usize - 1 || anchor >= vocab {
+            return Err(TreeError::Malformed(
+                "invalid external tree size or anchor".into(),
+            ));
+        }
+        let mut nodes: Vec<Node> = Vec::with_capacity(entries.len());
+        let mut siblings = std::collections::BTreeSet::new();
+        for (parent, token) in entries.iter().copied() {
+            if token >= vocab || !siblings.insert((parent, token)) {
+                return Err(TreeError::Malformed(
+                    "invalid external token or duplicate sibling".into(),
+                ));
+            }
+            let depth = match parent {
+                None => 1,
+                Some(parent) => {
+                    nodes
+                        .get(parent)
+                        .ok_or_else(|| {
+                            TreeError::Malformed("external parent must precede its child".into())
+                        })?
+                        .depth
+                        + 1
+                }
+            };
+            nodes.push(Node {
+                parent,
+                depth,
+                cand: nodes.len() as u32,
+            });
+        }
+        let tree = SpecTree::new_limited(nodes, TREE_MAX_ROWS - 1)?;
+        Self::new(tree, i64::from(anchor), |node| {
+            i64::from(entries[node.cand as usize].1)
         })
     }
 

@@ -1442,6 +1442,41 @@ fn swept_cache(resolved: &saber_plan::Resolved<'_>, unstable_op: &str) -> Autotu
     cache
 }
 
+#[test]
+fn mixed_widths_keep_separate_policy_families_but_reject_stale_wide_records() {
+    let mut manifest = Manifest::from_str(
+        include_str!("../../../examples/qwen38-27b-nvfp4-tp2-w16.toml"),
+        "mixed-widths",
+    )
+    .unwrap();
+    let mut narrow = manifest.buckets[0].clone();
+    narrow.spec_width = 5;
+    manifest.buckets.push(narrow);
+    let device = DeviceProfile::gfx1201_reference();
+    let model = ModelSpec::qwen38_27b_dense(2).unwrap();
+    let registry = saber_plan::registry_from_prebuilt(&saber_kernels::prebuilt::dir()).unwrap();
+    let resolved = resolve(&manifest, &device, &model, &registry).unwrap();
+    let mut fixture = swept_cache(&resolved, "");
+    fixture.one_policy_digest_per_op().unwrap();
+    let policies = fixture.policy_digests_by_op();
+    assert_ne!(
+        policies["attn_decode_paged"],
+        policies["attn_decode_paged[uniform16]"]
+    );
+    let entry = fixture
+        .entries()
+        .find(|e| e.record.impl_name.starts_with("attn_decode_uniform16"))
+        .unwrap()
+        .clone();
+    let mut stale = entry.key;
+    stale.policy_digest.push_str("-previous");
+    fixture.insert(stale, entry.record);
+    assert_eq!(
+        fixture.one_policy_digest_per_op().unwrap_err().op,
+        "attn_decode_paged[uniform16]"
+    );
+}
+
 /// Records per op, which is what a census over the cache reads and what a merge can silently
 /// double.
 fn counts_by_op(cache: &AutotuneCache) -> std::collections::BTreeMap<String, usize> {

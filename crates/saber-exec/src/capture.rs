@@ -18,7 +18,8 @@
 //!    arena to the **maximum over the sequence**, so no slab grows (and no address moves) once the
 //!    capture is open.
 //! 2. **The node count is asserted, not observed.** `hipGraphGetNodes` says how many nodes the
-//!    capture produced; it must equal the sum of the ops' declared `n_launches`. A mismatch names
+//!    capture produced; native nodes must equal the declared `n_launches`. RCCL mixed graphs
+//!    additionally declare one event-record node per collective, with node kinds audited. A mismatch names
 //!    the op and refuses (rule 7). This is the check that makes a launch budget a budget.
 //! 3. **A `!graph_safe` op cannot be captured — by type.** [`CapturableOp`] is the only thing
 //!    [`CapturedBucket::capture`] accepts, and it cannot be built without a [`GraphSafe`] proof.
@@ -185,6 +186,13 @@ impl std::fmt::Debug for CapturableOp<'_> {
     }
 }
 
+// HIP enum values confirmed against hip_runtime_api.h: Kernel=0, EventRecord=7.
+fn rccl_graph_matches(types: &[i32], kernels: usize, collectives: usize) -> bool {
+    types.len() == kernels + collectives
+        && types.iter().filter(|&&t| t == 0).count() == kernels
+        && types.iter().filter(|&&t| t == 7).count() == collectives
+}
+
 /// A recorded sequence of launches, instantiated and ready to replay.
 ///
 /// Holds the graph as well as the executable: HIP allows the graph to be freed after
@@ -195,6 +203,7 @@ pub struct CapturedBucket {
     graph: Graph,
     exec: GraphExec,
     nodes: usize,
+    synchronization_nodes: usize,
     declared: u32,
     ops: usize,
     counters: Arc<CaptureCounters>,
@@ -269,7 +278,24 @@ impl CapturedBucket {
 
         // ---- rule 7: the budget is asserted, not observed ------------------------------------
         let nodes = ctx.hip.graph_node_count(&graph)?;
-        if nodes as u32 != declared || issued != declared {
+        let rccl_calls = ops
+            .iter()
+            .flat_map(|o| o.descs)
+            .filter(|d| d.plugin == saber_kernels::saber::RCCL_PLUGIN)
+            .count();
+        if rccl_calls > 0 {
+            // RCCL 2.30.4 mixed eager/graph mode records one completion event per call.
+            // Count kernel dispatches and synchronization nodes separately; never relax the
+            // launch budget or allow arbitrary library-inserted graph work.
+            let types = ctx.hip.graph_node_types(&graph)?;
+            if issued != declared
+                || types.len() != nodes
+                || !rccl_graph_matches(&types, declared as usize, rccl_calls)
+            {
+                counters.hit_refused_launch_count();
+                return Err(Error::Refused(format!("capture `{label}`: expected {declared} kernel nodes and {rccl_calls} RCCL event-record nodes; issued {issued}, graph node kinds {types:?}")));
+            }
+        } else if nodes as u32 != declared || issued != declared {
             counters.hit_refused_launch_count();
             return Err(Error::LaunchBudget {
                 label,
@@ -292,6 +318,7 @@ impl CapturedBucket {
             graph,
             exec,
             nodes,
+            synchronization_nodes: rccl_calls,
             declared,
             ops: ops.len(),
             counters: Arc::clone(counters),
@@ -305,10 +332,22 @@ impl CapturedBucket {
         Ok(())
     }
 
-    /// Nodes the capture actually produced — equal to the declared launch count, by construction.
+    /// Nodes the capture produced, including explicitly audited RCCL completion events.
     #[must_use]
     pub fn node_count(&self) -> usize {
         self.nodes
+    }
+
+    /// Actual compute nodes, after separately validating external-library completion events.
+    #[must_use]
+    pub fn kernel_node_count(&self) -> usize {
+        self.nodes - self.synchronization_nodes
+    }
+
+    /// Explicitly budgeted synchronization nodes in addition to kernel launches.
+    #[must_use]
+    pub fn synchronization_node_count(&self) -> usize {
+        self.synchronization_nodes
     }
 
     /// The launch count the ops declared.
@@ -349,6 +388,15 @@ impl std::fmt::Debug for CapturedBucket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_graph_budget_rejects_missing_extra_or_unknown_nodes() {
+        assert!(super::rccl_graph_matches(&[0, 7, 0, 0, 7], 3, 2));
+        assert!(!super::rccl_graph_matches(&[0, 7, 0, 0], 3, 2));
+        assert!(!super::rccl_graph_matches(&[0, 7, 0, 0, 7, 0], 3, 2));
+        assert!(!super::rccl_graph_matches(&[0, 7, 0, 0, 3], 3, 2));
+        assert!(!super::rccl_graph_matches(&[0, 0, 0, 0, 7], 3, 2));
+    }
 
     #[test]
     fn graph_safety_needs_both_bits_to_agree() {

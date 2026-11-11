@@ -613,6 +613,7 @@ impl<R: ForwardRunner> RealExecutor<R> {
 #[derive(Debug)]
 pub struct RealExecutor<R: ForwardRunner> {
     forward: R,
+    scalar_context_tail: bool,
     counters: EngineCounters,
     /// Sequences the engine has session state for, and their prompt length.
     live: BTreeMap<SeqId, u32>,
@@ -712,6 +713,11 @@ struct DeferredCollect {
 }
 
 impl<R: ForwardRunner> RealExecutor<R> {
+    /// Use the ordinary one-row verifier when a full rectangular proposal would cross max_ctx.
+    pub fn enable_scalar_context_tail(&mut self) {
+        self.scalar_context_tail = true;
+    }
+
     /// C9: the fused mixed forward on or off (`--engine-mixed-prefill fused` / `serial`). Only
     /// meaningful when the scheduler mixes at all.
     pub fn set_fused_mixed(&mut self, on: bool) {
@@ -727,6 +733,7 @@ impl<R: ForwardRunner> RealExecutor<R> {
     pub fn with_drafter(forward: R, drafter: Box<dyn Drafter>) -> Self {
         Self {
             forward,
+            scalar_context_tail: false,
             counters: EngineCounters::default(),
             live: BTreeMap::new(),
             vision_pending: BTreeMap::new(),
@@ -1458,6 +1465,7 @@ impl<R: ForwardRunner> RealExecutor<R> {
             rows: chunk.prompt_tokens,
             width: 1,
             samples: chunk.last,
+            tree: false,
             ragged: false,
         };
         // Only the LAST chunk samples, so only it asks the head for a seam: a chunk that is not
@@ -1667,7 +1675,24 @@ impl<R: ForwardRunner> RealExecutor<R> {
         // run fewer rows than the bucket has, which the engine refuses rather than padding a
         // sequence's own rows. So the proposal is padded to the bucket's width with a token the model
         // cannot want, which costs the same rows and is honestly reported as drafted.
-        let width = batch.bucket.spec_width.max(1);
+        let scheduled_width = batch.bucket.spec_width.max(1);
+        // A rectangular bucket pads short proposals. At the end of the context those
+        // padding rows have no valid KV positions. The single-sequence DSpine profile
+        // always plans the ordinary one-row graph, including beside the best16 tree.
+        let width = if self.scalar_context_tail
+            && shape == 1
+            && !batch.bucket.is_band()
+            && batch.slots.first().is_some_and(|slot| {
+                self.forward
+                    .facts()
+                    .max_ctx
+                    .saturating_sub(slot.context_len)
+                    < scheduled_width
+            }) {
+            1
+        } else {
+            scheduled_width
+        };
         let k = width - 1;
         // A decode ROW BAND (C2): every slot verifies its OWN `BatchSlot::verify_width` rows (the
         // scheduler's per-slot cap, 1 on a first step), the drafter is asked for `w_i - 1` and
@@ -1773,6 +1798,7 @@ impl<R: ForwardRunner> RealExecutor<R> {
             rows: band.unwrap_or(shape * width),
             width,
             samples: true,
+            tree: false,
             ragged: band.is_some(),
         };
         let clock = std::time::Instant::now();

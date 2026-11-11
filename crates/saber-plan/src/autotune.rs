@@ -444,14 +444,22 @@ impl AutotuneCache {
 
     /// Every op in the cache and the policy digests its records carry.
     ///
-    /// One op's routes bind one table set, so one op's records carry one digest. Two is a cache
-    /// that has been merged across a policy edit and kept both sides — see
+    /// The uniform 16-query attention pair uses a dedicated head table and the shared
+    /// combine table, so it has a separate policy family from narrow attention. Within
+    /// a family two digests indicate a merge that retained both sides of an edit. See
     /// [`AutotuneCache::one_policy_digest_per_op`].
     #[must_use]
     pub fn policy_digests_by_op(&self) -> BTreeMap<&str, BTreeSet<&str>> {
         let mut out: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         for entry in self.entries.values() {
-            out.entry(entry.key.op.as_str())
+            let family = if entry.key.op == "attn_decode_paged"
+                && entry.key.shape.get("q_len") == Some(&crate::shape::ShapeValue::Num(16))
+            {
+                "attn_decode_paged[uniform16]"
+            } else {
+                entry.key.op.as_str()
+            };
+            out.entry(family)
                 .or_default()
                 .insert(entry.key.policy_digest.as_str());
         }

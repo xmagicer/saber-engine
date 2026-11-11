@@ -1175,8 +1175,7 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.cache/dflash_cases.jsonl")
     }
 
-    const REGENERATE: &str =
-        "regenerate it with the internal reference harness (the exact \
+    const REGENERATE: &str = "regenerate it with the internal reference harness (the exact \
                               podman line is in that script's module docstring)";
 
     /// `None` means "cases absent" — the caller prints the loud skip and returns.

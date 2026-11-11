@@ -74,6 +74,16 @@ pub struct EngineArgs {
     pub prebuilt: PathBuf,
     /// The HIP runtime's soname.
     pub hip_lib: String,
+    /// Optional RCCL compatibility library; selects host-capable collectives.
+    pub rccl_lib: Option<String>,
+    /// Explicit native exact collectives over registered shared host pages.
+    pub host_ar: bool,
+    /// Diagnostic rank-zero target-feature capture for offline draft validation.
+    pub draft_capture_dir: Option<PathBuf>,
+    /// An explicit Unix socket for external DSpine proposals.
+    pub dspine_socket: Option<PathBuf>,
+    /// Independent target feature plane used by offline draft validation.
+    pub draft_capture_layers: Vec<u32>,
     /// HIP device ordinal within the visible set.
     pub device: i32,
     /// Refuse to start if the engine's device buffers would exceed this.
@@ -379,6 +389,15 @@ impl EngineArgs {
             rank: self.rank,
             prebuilt: self.prebuilt.clone(),
             hip_lib: self.hip_lib.clone(),
+            rccl_lib: self.rccl_lib.clone(),
+            host_ar: self.host_ar,
+            dspine_socket: self.dspine_socket.clone(),
+            draft_capture_layers: self.draft_capture_layers.clone(),
+            draft_capture_dir: if self.rank == 0 {
+                self.draft_capture_dir.clone()
+            } else {
+                None
+            },
             device: self.device,
             budget_mib: self.budget_mib,
             max_seqs: self.max_seqs,
@@ -1565,6 +1584,7 @@ fn attribute_buckets(
         rows: b * width,
         width,
         samples: true,
+        tree: false,
         ragged: false,
     };
     out.deltas = forward
@@ -4248,6 +4268,7 @@ pub fn gate(args: &GateArgs) -> anyhow::Result<usize> {
         rows: width,
         width,
         samples: true,
+        tree: false,
         ragged: false,
     };
     let per_step_launches = forward.declared_launches(decode1).unwrap_or(0);
@@ -6400,6 +6421,7 @@ pub fn gate(args: &GateArgs) -> anyhow::Result<usize> {
                     rows: b * width,
                     width,
                     samples: true,
+                    tree: false,
                     ragged: false,
                 };
                 facts.ar_family(rows).map(|f| (b, f))
@@ -9743,7 +9765,8 @@ pub fn serve(args: &ServeArgs) -> anyhow::Result<()> {
     // executor keeps `NoDrafter` and a width-`w` bucket runs `w` rows of which `w - 1` are a token
     // the model cannot want -- SPEC=0 reached through the verify path, which is what it always was.
     let serve_width = forward.facts().max_width;
-    let serve_drafts = forward.facts().draft_resident.is_some();
+    let serve_drafts =
+        forward.facts().draft_resident.is_some() || args.engine.dspine_socket.is_some();
     // THE PAIRING CONTROLS, REFUSED WHEN THEY CANNOT BE HONOURED (ws-f37). `--propose-in-step`
     // moves the engine's own proposal back inside the step; with no resident drafter there is no
     // proposal to move. `--keep-stale-anchor-blocks` offers a block the in-step order anchored on
@@ -9782,9 +9805,20 @@ pub fn serve(args: &ServeArgs) -> anyhow::Result<()> {
     );
     if serve_width > 1 && serve_drafts {
         executor.set_drafter(Box::new(EngineDrafter::new(serve_width - 1)));
-        println!(
-            "drafter        the engine's own DFlash2 proposal, block {serve_width}, one per live              slot per decode step"
-        );
+        if args.engine.dspine_socket.is_some()
+            || (matches!(
+                args.engine.spec_tree,
+                saber_engine::spec_tree::SpecTreeForm::Best16
+                    | saber_engine::spec_tree::SpecTreeForm::Ancestor9
+            ) && args.engine.draft_block == 16)
+        {
+            executor.enable_scalar_context_tail();
+        }
+        if args.engine.dspine_socket.is_some() {
+            println!("drafter        DSpine Unix socket, scheduled verify width {serve_width}");
+        } else {
+            println!("drafter        the engine's own DFlash2 proposal, block {serve_width}, one per live slot per decode step");
+        }
         // FN69: prompt-lookup speculation in front of the mailbox (the verify is unchanged).
         if let Some(cfg) = args.spec_lookup {
             executor.set_drafter(Box::new(saber_engine::LookupDrafter::new(
@@ -10224,7 +10258,26 @@ impl Worker {
             .arg("--deadline-s")
             .arg(args.deadline_s.to_string());
         if !args.capture {
+            // Keep the follower on the leader's explicitly selected transport.
             cmd.arg("--no-capture");
+        }
+        if args.host_ar {
+            cmd.arg("--host-ar");
+        }
+        if let Some(path) = &args.rccl_lib {
+            cmd.arg("--rccl-lib").arg(path);
+        }
+        if let Some(path) = &args.dspine_socket {
+            cmd.arg("--dspine-socket").arg(path);
+        }
+        if !args.draft_capture_layers.is_empty() {
+            cmd.arg("--draft-capture-layers").arg(
+                args.draft_capture_layers
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
         }
         // D4: the tower on rank 1 too (replicated), sized as the leader's.
         if args.vision_max_patches > 0 {
@@ -11316,6 +11369,11 @@ mod ar_band_tests {
             peer_device: 1,
             prebuilt: std::path::PathBuf::from("prebuilt/gfx1201"),
             hip_lib: saber_hip::DEFAULT_HIP_SONAME.to_owned(),
+            rccl_lib: None,
+            host_ar: false,
+            dspine_socket: None,
+            draft_capture_dir: None,
+            draft_capture_layers: Vec::new(),
             device: 0,
             budget_mib: 26000,
             max_seqs: 2,

@@ -95,14 +95,6 @@ impl RequestShape<'_> {
     fn choice_is_none(&self) -> bool {
         self.effective_choice().and_then(Value::as_str) == Some("none")
     }
-
-    /// `tool_choice` absent (with tools present that is the protocol's `"auto"`) or `"auto"`.
-    fn choice_is_auto(&self) -> bool {
-        match self.effective_choice() {
-            None => self.has_tools(),
-            Some(v) => v.as_str() == Some("auto"),
-        }
-    }
 }
 
 /// `OnlineRenderer.render_chat_request`'s refusal of a `tool_choice` the flags cannot serve, with
@@ -204,7 +196,7 @@ impl ServeParser {
             reasoning,
             tool,
             tool_started: false,
-            strip_calls: shape.choice_is_none() || !(shape.has_tools() && shape.choice_is_auto()),
+            strip_calls: shape.choice_is_none() || !shape.has_tools(),
         })
     }
 

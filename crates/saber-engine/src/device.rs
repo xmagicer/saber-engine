@@ -647,6 +647,16 @@ pub struct EngineConfig {
     pub prebuilt: PathBuf,
     /// The HIP runtime's soname.
     pub hip_lib: String,
+    /// Explicit RCCL compatibility backend; `None` retains the native P2P backend.
+    pub rccl_lib: Option<String>,
+    /// Explicit native exact collectives over registered shared host pages.
+    pub host_ar: bool,
+    /// Diagnostic export of committed target features; rank 0, one sequence, no prefix caching.
+    pub draft_capture_dir: Option<PathBuf>,
+    /// Live DSpine sidecar. Both ranks tap the same edges; only rank zero connects.
+    pub dspine_socket: Option<PathBuf>,
+    /// Optional independent capture-layer plane; forwarded to both TP ranks.
+    pub draft_capture_layers: Vec<u32>,
     /// HIP device ordinal within the visible set.
     pub device: i32,
     /// Refuse to start if the engine's device buffers would exceed this. The byte ledger is the
@@ -1988,7 +1998,7 @@ pub fn spawn(cfg: EngineConfig, ledger: Ledger) -> Result<(HipForward, Ledger), 
     // branch's first block from the prompt proposal kept after the commit — which the in-step
     // order (`--propose-in-step`, a pairing control) never keeps. That one combination is refused
     // at submit rather than served with branches whose first step verifies nothing.
-    let can_fork = fork_supported(cfg.draft_block, cfg.propose_at);
+    let can_fork = cfg.dspine_socket.is_none() && fork_supported(cfg.draft_block, cfg.propose_at);
     let vision_max_patches = cfg.vision_max_patches;
     let defer_store = cfg.draft_store_deferred && cfg.propose_at == ProposeAt::AfterCommit;
     let (tx, rx) = mpsc::channel::<Req>();
@@ -3049,6 +3059,10 @@ struct Seam {
 /// the five taps differ only in which edge they read and which column block they write, both of
 /// which are bindings.
 struct AuxTap {
+    tree: Option<std::rc::Rc<TreeDevice>>,
+    dspine: Option<std::cell::RefCell<crate::dspine_socket::DspineSocket>>,
+    capture_extra: Option<(crate::aux_tap::AuxTapPlan, DevicePtr)>,
+    capture: Option<std::sync::Mutex<crate::draft_capture::TargetAuxCapture>>,
     plan: crate::aux_tap::AuxTapPlan,
     /// `[rows, 5 * hidden]` bf16.
     buf: DevicePtr,
@@ -3061,6 +3075,58 @@ struct AuxTap {
 }
 
 impl AuxTap {
+    fn capture_rows(
+        &self,
+        hip: &HipThread,
+        stream: &Stream,
+        seq: SeqId,
+        position: u32,
+        tokens: &[TokenId],
+        row0: usize,
+        kind: &str,
+    ) -> Result<(), ForwardError> {
+        if self.capture.is_none() && self.dspine.is_none() {
+            return Ok(());
+        }
+        if row0 + tokens.len() > self.rows as usize {
+            return Err(ForwardError::Device(
+                "target capture window exceeds auxiliary buffer".into(),
+            ));
+        }
+        let (capture_plan, capture_buf) = self
+            .capture_extra
+            .as_ref()
+            .map(|(p, b)| (p, b))
+            .unwrap_or((&self.plan, &self.buf));
+        let row_bytes = capture_plan.row_elems() as usize * 2;
+        let addr = capture_buf
+            .addr()
+            .offset((row0 * row_bytes) as u64)
+            .ok_or_else(|| ForwardError::Device("target capture address overflow".into()))?;
+        let mut bytes = vec![0; tokens.len() * row_bytes];
+        hip.sync_stream(stream)
+            .map_err(device_err("target capture completion"))?;
+        hip.memcpy_d2h_addr_blocking(&mut bytes, addr, stream)
+            .map_err(device_err("target capture readback"))?;
+        if let Some(socket) = &self.dspine {
+            return socket
+                .borrow_mut()
+                .append(seq, position, &bytes)
+                .map_err(device_err("appending committed DSpine features"));
+        }
+        self.capture
+            .as_ref()
+            .expect("a capture sink was checked")
+            .lock()
+            .map_err(|_| ForwardError::Device("target capture lock poisoned".into()))?
+            .record(seq, position, tokens, &bytes, kind)
+            .map_err(device_err("target capture write"))
+    }
+
+    fn launches(&self) -> u32 {
+        self.plan.launches() + self.capture_extra.as_ref().map_or(0, |(p, _)| p.launches())
+    }
+
     /// Where tap `k`'s column block starts.
     fn out(&self, k: usize) -> Result<DeviceAddr, ForwardError> {
         self.buf
@@ -3096,6 +3162,8 @@ struct Geom {
     max_ctx: u32,
     max_blocks: u32,
     block_size: u32,
+    /// Reserved consecutive recurrent snapshots per live sequence.
+    state_width: u32,
 }
 
 /// One sequence's session facts.
@@ -4382,6 +4450,90 @@ fn run(
     mut phases: crate::startup::Phases,
 ) -> Result<(), ForwardError> {
     use crate::startup::Phase as Boot;
+    let dspine = cfg.dspine_socket.is_some();
+    if cfg.draft_block == 16
+        && cfg.spec_tree == crate::spec_tree::SpecTreeForm::Ancestor9
+        && (cfg.max_seqs != 1
+            || cfg.decode_batches != [1]
+            || cfg.decode_widths != [1, 10]
+            || cfg.gdn_replay)
+    {
+        return Err(ForwardError::Device("native block16 ancestor9 requires one sequence, batches 1, widths 1,10 and --engine-gdn-replay off".into()));
+    }
+    if dspine
+        && (cfg.max_seqs != 1
+            || cfg.decode_batches != [1]
+            || !matches!(cfg.decode_widths.as_slice(), [1, 8] | [1, 16])
+            || cfg.draft_block != 0
+            || cfg.draft_pack.is_some()
+            || (cfg.decode_widths == [1, 16] && cfg.gdn_replay)
+            || cfg.draft_capture_dir.is_some()
+            || !cfg.draft_capture_layers.is_empty()
+            || !(cfg.spec_tree == crate::spec_tree::SpecTreeForm::Off
+                || (cfg.spec_tree == crate::spec_tree::SpecTreeForm::Best16
+                    && cfg.world == 2
+                    && cfg.decode_widths == [1, 16]))
+            || cfg.propose_at != ProposeAt::AfterCommit
+            || graph.config.hidden_size != 5120
+            || graph.config.num_hidden_layers != 64)
+    {
+        return Err(ForwardError::Device("DSpine socket expects the 64-layer 27B target, one sequence, decode batches 1, widths 1,8 or 1,16, after-commit verification, replay off for width 16, tree off or TP2 best16 at width 16, no DFlash2 tier or capture export".into()));
+    }
+    if cfg.draft_capture_dir.is_some() && (cfg.max_seqs != 1 || cfg.draft_pack.is_none()) {
+        return Err(ForwardError::Device("target feature capture requires max-seqs=1 and a resident drafter; disable prefix caching".into()));
+    }
+    if !cfg.draft_capture_layers.is_empty() {
+        if cfg.draft_capture_layers.len() != crate::draft_inputs::AUX_TAPS.len()
+            || cfg
+                .draft_capture_layers
+                .iter()
+                .any(|l| *l >= graph.config.num_hidden_layers)
+        {
+            return Err(ForwardError::Device(
+                "capture layer plane must have five valid target layers".into(),
+            ));
+        }
+        crate::aux_tap::AuxTapPlan::for_layers(
+            graph.config.hidden_size,
+            &cfg.draft_capture_layers,
+        )?;
+        if cfg.rank == 0 && cfg.draft_capture_dir.is_none() {
+            return Err(ForwardError::Device(
+                "capture layers require a rank-zero capture directory".into(),
+            ));
+        }
+    }
+    let mut resolved = cfg.clone();
+    if resolved.host_ar {
+        if resolved.world != 2 {
+            return Err(ForwardError::Device("host collectives require TP=2".into()));
+        }
+        resolved.ar_exact = true;
+        resolved.ar_fuse = false;
+        resolved.ar_wpar = false;
+        resolved.device_step = crate::device_step::DeviceStep::Off;
+        println!(
+            "collectives rank {}: registered shared host pages, bounded exact BF16 kernels; no P2P",
+            resolved.rank
+        );
+    }
+    if resolved.rccl_lib.is_some() {
+        if resolved.world != 2 {
+            return Err(ForwardError::Device(
+                "RCCL compatibility requires TP=2".into(),
+            ));
+        }
+        resolved.ar_fuse = false;
+        if resolved.race_check || resolved.race_shadow {
+            return Err(ForwardError::Device(
+                "P2P race diagnostics are unavailable with RCCL compatibility".into(),
+            ));
+        }
+        resolved.device_step = crate::device_step::DeviceStep::Off;
+        resolved.ar_exact = true;
+        println!("collectives rank {}: RCCL compatibility; exact BF16, P2P AR fusion off, host candidate seam", resolved.rank);
+    }
+    let cfg = &resolved;
     let mut mark = Instant::now();
     hip.set_device(cfg.device)
         .map_err(device_err("set_device"))?;
@@ -4574,9 +4726,26 @@ fn run(
     }
     let mxfp4 = mxfp4;
     let mut saber = SaberRules::prod_saber().map_err(device_err("saber rules"))?;
+    if cfg.rccl_lib.is_some() {
+        saber.ar.external_rccl = true;
+        if cfg.host_ar {
+            // Every served 27B decode rectangle has at most 64 rows. Larger
+            // messages use RCCL's bulk transfer; small ones keep native fusion.
+            saber.ar.external_rccl_min_bytes = u64::from(graph.config.hidden_size) * 65 * 2;
+            println!("collectives rank {}: hybrid RCCL for >= {} B; smaller exact collectives use registered host pages", cfg.rank, saber.ar.external_rccl_min_bytes);
+        }
+        saber.name = format!("{}+rccl-bf16", saber.name);
+    }
     // T4: every all-reduce resolves to its race-check twin. Set before any plan resolves a reduce,
     // so the target's, the drafter's and row 3's fold all see the same answer.
     saber.ar.race_check = cfg.race_check;
+    saber.ar.host_mapped = cfg.host_ar;
+    if cfg.host_ar {
+        println!(
+            "hostfence rank {}: store drain {} / acquire {}; registered fine-grained shared pages",
+            cfg.rank, saber.ar.drain, saber.ar.acq
+        );
+    }
     if cfg.ar_wpar {
         // CMP27S: the wave-parallel wht6 body for every rotated reduce whose chunks a block fit
         // its LDS (the prefill rungs, the drafter and the decode graphs alike). The route is a
@@ -4648,6 +4817,78 @@ fn run(
         None => None,
     };
     let follower = matches!(cfg.peer.as_ref().map(|p| p.role), Some(PeerRole::Follower));
+    if let Some(p) = &peer {
+        p.agree(
+            "engine.collective-backend",
+            u64::from(cfg.rccl_lib.is_some()) | (u64::from(cfg.host_ar) << 1),
+        )
+        .map_err(|e| ForwardError::Peer(e.to_string()))?;
+    }
+    // RCCL retains its previous eager stream to record cross-stream completion
+    // events on the next call. Warm on the model's lifetime stream: destroying
+    // a temporary warm stream leaves a dangling handle when decode graphs use
+    // native collectives and do not update RCCL's remembered stream.
+    let stream = hip
+        .create_stream(StreamFlags::NonBlocking)
+        .map_err(device_err("create_stream"))?;
+    let rccl = if let Some(path) = &cfg.rccl_lib {
+        let p = peer
+            .as_ref()
+            .ok_or_else(|| ForwardError::Peer("RCCL requires a rank peer".into()))?;
+        let before = hip.mem_info().map_err(device_err("RCCL memory before"))?.0;
+        let version = hip
+            .rccl_library_version(path)
+            .map_err(device_err("loading RCCL"))?;
+        p.agree("engine.rccl-version", version as u64)
+            .map_err(|e| ForwardError::Peer(e.to_string()))?;
+        let mine = if cfg.rank == 0 {
+            hip.rccl_unique_id(path)
+                .map_err(device_err("RCCL bootstrap ID"))?
+                .as_bytes()
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+        let theirs = p
+            .exchange()
+            .xchg_bytes("engine.rccl-id", &mine)
+            .map_err(|e| ForwardError::Peer(e.to_string()))?;
+        let id = saber_hip::RcclUniqueId::from_bytes(if cfg.rank == 0 { &mine } else { &theirs })
+            .map_err(device_err("RCCL ID frame"))?;
+        let comm = hip
+            .rccl_init_rank(path, cfg.world as i32, cfg.rank as i32, &id)
+            .map_err(device_err("RCCL communicator"))?;
+        {
+            let warm = hip
+                .malloc(saber.ar.max_bytes)
+                .map_err(device_err("RCCL warm buffer"))?;
+            hip.memset(&warm, 0, &stream)
+                .map_err(device_err("RCCL warm zero"))?;
+            hip.rccl_all_reduce_bf16(
+                &comm,
+                warm.addr(),
+                warm.addr(),
+                (saber.ar.max_bytes / 2) as usize,
+                &stream,
+            )
+            .map_err(device_err("RCCL warm collective"))?;
+            hip.sync_stream(&stream)
+                .map_err(device_err("RCCL warm completion"))?;
+        }
+        let after = hip.mem_info().map_err(device_err("RCCL memory after"))?.0;
+        let bytes = before.saturating_sub(after);
+        ledger
+            .reserve(Pool::Vram(cfg.rank), "engine.collectives.rccl", bytes)
+            .map_err(device_err("RCCL memory ledger"))?;
+        println!(
+            "collectives rank {}: RCCL {version}, native reservation {} MiB",
+            cfg.rank,
+            bytes >> 20
+        );
+        Some(std::rc::Rc::new(comm))
+    } else {
+        None
+    };
 
     let layers: Vec<u32> = (0..graph.config.num_hidden_layers).collect();
     let decode_widths = planned_widths(&cfg.decode_widths)?;
@@ -4771,6 +5012,53 @@ fn run(
                 bytes >> 20
             ))
         })
+    }
+
+    let independent_capture = !cfg.draft_capture_layers.is_empty()
+        && cfg.draft_capture_layers.as_slice() != crate::draft_inputs::AUX_TAPS;
+    let capture_max_rows = cfg.prefill_rows.iter().copied().max().unwrap_or(1).max(
+        cfg.max_seqs
+            * cfg
+                .decode_widths
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(1)
+                .max(crate::spec_tree::TREE_MAX_ROWS as u32),
+    );
+    let dspine_aux_bytes = if dspine {
+        let plan = crate::aux_tap::AuxTapPlan::for_layers(
+            graph.config.hidden_size,
+            &crate::dspine_socket::LAYERS,
+        )?;
+        let bytes = plan.bytes(capture_max_rows);
+        bill(
+            &mut budget,
+            &mut ledger,
+            cfg.rank,
+            bytes,
+            "engine.dspine.aux_cat",
+        )?;
+        bytes
+    } else {
+        0
+    };
+    let capture_extra_bytes = if independent_capture {
+        u64::from(capture_max_rows)
+            * u64::from(graph.config.hidden_size)
+            * cfg.draft_capture_layers.len() as u64
+            * 2
+    } else {
+        0
+    };
+    if capture_extra_bytes > 0 {
+        bill(
+            &mut budget,
+            &mut ledger,
+            cfg.rank,
+            capture_extra_bytes,
+            "engine.draft.capture_aux",
+        )?;
     }
 
     phases.record(Boot::PeerExchange, mark.elapsed(), "the socket");
@@ -5522,10 +5810,6 @@ fn run(
         .functions(hip)
         .map_err(device_err("plugin symbols"))?;
     let ctx = LaunchCtx::new(hip, &functions);
-    let stream = hip
-        .create_stream(StreamFlags::NonBlocking)
-        .map_err(device_err("create_stream"))?;
-
     phases.record(
         Boot::CodeObjects,
         mark.elapsed(),
@@ -5854,9 +6138,19 @@ fn run(
             uplan.staging_bytes.max(1)
                 + cfg.park_staging_bytes
                 + cfg.park_tier_bytes
-                + vision_host.map_or(0, |(a, b)| a + b),
+                + vision_host.map_or(0, |(a, b)| a + b)
+                + if cfg.host_ar { 1024 * 1024 * 1024 } else { 0 },
         )
         .map_err(device_err("declaring pinned host"))?;
+    if cfg.host_ar {
+        ledger
+            .reserve(
+                Pool::HostPinned,
+                "engine.collectives.host-cap",
+                1024 * 1024 * 1024,
+            )
+            .map_err(device_err("reserving shared host collective pages"))?;
+    }
     let reserved = upload
         .reserve(&mut ledger)
         .map_err(device_err("reserving the upload"))?;
@@ -6159,9 +6453,10 @@ fn run(
             let rec_bytes = u64::from(graph.config.linear_num_value_heads / cfg.world.max(1))
                 * crate::spec_tree::tree_record_bytes(arm.runs.rows());
             let mut keys: BTreeSet<String> = BTreeSet::new();
-            for p in plans.iter().filter(|p| {
-                p.phase == Phase::Decode && p.width == p.rows && p.rows == arm.runs.rows() as u32
-            }) {
+            for p in plans
+                .iter()
+                .filter(|p| matches!(p.plan.bucket, GraphBucket::DecodeTree { .. }))
+            {
                 for st in &p.plan.steps {
                     if let Some(saber_exec::layer::Source::State { key, .. }) = st.source("ts_in") {
                         keys.insert(key.clone());
@@ -6175,11 +6470,10 @@ fn run(
             // the one-record form iff the in-place read-before-write is safe.
             let pair_form = arm.runs == crate::spec_tree::SpecTreeForm::Ancestor9Pair;
             if pair_form {
-                for p in plans.iter_mut().filter(|p| {
-                    p.phase == Phase::Decode
-                        && p.width == p.rows
-                        && p.rows == arm.runs.rows() as u32
-                }) {
+                for p in plans
+                    .iter_mut()
+                    .filter(|p| matches!(p.plan.bucket, GraphBucket::DecodeTree { .. }))
+                {
                     for st in &mut p.plan.steps {
                         for (name, src) in &mut st.bindings {
                             if name == "ts_out" {
@@ -6626,13 +6920,7 @@ fn run(
     // no other plan) sized to the tree step itself (one sequence, `tree_rows` rows, the widest
     // page list) and written only at a tree step. Empty = the control (every key at every step).
     let tree_only_keys: BTreeSet<String> = if cfg.step_arms.treeblob && tree_runs {
-        let is_tree = |p: &Planned<'_>| {
-            p.phase == Phase::Decode
-                && !p.ragged
-                && p.batch == 1
-                && p.rows == tree_rows
-                && p.width == tree_rows
-        };
+        let is_tree = |p: &Planned<'_>| matches!(p.plan.bucket, GraphBucket::DecodeTree { .. });
         let mut tree_keys: BTreeSet<String> = BTreeSet::new();
         let mut other_keys: BTreeSet<String> = BTreeSet::new();
         for p in &plans {
@@ -6956,8 +7244,15 @@ fn run(
     // The number is the tap list's own length rather than a literal, and it is computed before the
     // tap object exists because the budget is a property of the plan and the tap is a property of
     // the card.
-    let tap_launches = if cfg.draft_block > 0 {
-        crate::draft_inputs::AUX_TAPS.len() as u32
+    let tap_launches = if dspine {
+        crate::dspine_socket::LAYERS.len() as u32
+    } else if cfg.draft_block > 0 {
+        (crate::draft_inputs::AUX_TAPS.len()
+            + if independent_capture {
+                cfg.draft_capture_layers.len()
+            } else {
+                0
+            }) as u32
     } else {
         0
     };
@@ -6977,6 +7272,7 @@ fn run(
                         rows: p.rows,
                         width: 1,
                         samples: false,
+                        tree: false,
                         ragged: false,
                     },
                     body + tap_launches,
@@ -6987,6 +7283,7 @@ fn run(
                         rows: p.rows,
                         width: 1,
                         samples: true,
+                        tree: false,
                         ragged: false,
                     },
                     body + head + tap_launches,
@@ -7003,6 +7300,7 @@ fn run(
                         rows: p.rows,
                         width: p.width,
                         samples: true,
+                        tree: matches!(p.plan.bucket, GraphBucket::DecodeTree { .. }),
                         ragged: p.ragged,
                     },
                     body + head.declared_launches() + tap_launches,
@@ -7016,11 +7314,26 @@ fn run(
     // `docs/EXEC.md` section 6 is why this is five COPIES and not a read afterwards: the body plan
     // runs with slot reuse on, so the five tapped edges are aliased onto a handful of buffers and
     // at the end of a step every one of them holds layer 63's value.
-    let aux_tap = if cfg.draft_block == 0 {
+    let mut aux_tap = if cfg.draft_block == 0 && !dspine {
         None
     } else {
-        let plan = crate::aux_tap::AuxTapPlan::new(hidden);
-        debug_assert_eq!(plan.launches(), tap_launches);
+        let plan = if dspine {
+            crate::aux_tap::AuxTapPlan::for_layers(hidden, &crate::dspine_socket::LAYERS)?
+        } else {
+            crate::aux_tap::AuxTapPlan::new(hidden)
+        };
+        let capture_plan = if independent_capture {
+            Some(crate::aux_tap::AuxTapPlan::for_layers(
+                hidden,
+                &cfg.draft_capture_layers,
+            )?)
+        } else {
+            None
+        };
+        debug_assert_eq!(
+            plan.launches() + capture_plan.as_ref().map_or(0, |p| p.launches()),
+            tap_launches
+        );
         let mut descs: BTreeMap<u32, LaunchDescriptor> = BTreeMap::new();
         let mut rows = 0u32;
         let mut decode_shapes = 0u32;
@@ -7036,7 +7349,11 @@ fn run(
             // EVERY tapped edge must be an edge of the real plan. A tap on a name the planner does
             // not carry would bind nothing and copy whatever the arena held — which is the failure
             // this whole module is arranged against — so it is a refusal at boot, by name.
-            for e in &plan.edges {
+            for e in plan
+                .edges
+                .iter()
+                .chain(capture_plan.iter().flat_map(|p| p.edges.iter()))
+            {
                 if p.plan.locate(e).is_none() {
                     return Err(ForwardError::Device(format!(
                         "the aux tap reads `{e}` and the {:?} plan at {} rows has no such edge: \
@@ -7055,13 +7372,21 @@ fn run(
             ));
         }
         let bytes = plan.bytes(rows);
-        bill(
-            &mut budget,
-            &mut ledger,
-            cfg.rank,
-            bytes,
-            "engine.draft.aux_cat",
-        )?;
+        if dspine {
+            if bytes > dspine_aux_bytes {
+                return Err(ForwardError::Device(
+                    "DSpine feature plane exceeds its reservation".into(),
+                ));
+            }
+        } else {
+            bill(
+                &mut budget,
+                &mut ledger,
+                cfg.rank,
+                bytes,
+                "engine.draft.aux_cat",
+            )?;
+        }
         let buf = hip.malloc(bytes).map_err(device_err("`aux.cat`"))?;
         hip.memset(&buf, 0, &stream)
             .map_err(device_err("zeroing `aux.cat`"))?;
@@ -7074,7 +7399,54 @@ fn run(
             plan.launches(),
             plan.row_elems(),
         );
+        let capture_extra = if let Some(p) = capture_plan {
+            let bytes = p.bytes(rows);
+            if bytes > capture_extra_bytes {
+                return Err(ForwardError::Device(
+                    "independent capture exceeds its pre-pool reservation".into(),
+                ));
+            }
+            let buffer = hip
+                .malloc(bytes)
+                .map_err(device_err("allocating independent capture"))?;
+            hip.memset(&buffer, 0, &stream)
+                .map_err(device_err("zeroing independent capture"))?;
+            Some((p, buffer))
+        } else {
+            None
+        };
+        let output_plan = capture_extra.as_ref().map(|(p, _)| p).unwrap_or(&plan);
+        let capture = if cfg.rank == 0 {
+            cfg.draft_capture_dir
+                .as_ref()
+                .map(|dir| {
+                    crate::draft_capture::TargetAuxCapture::new(
+                        dir,
+                        output_plan.hidden,
+                        &output_plan.layers,
+                    )
+                })
+                .transpose()
+                .map_err(device_err("creating target capture"))?
+                .map(std::sync::Mutex::new)
+        } else {
+            None
+        };
+        let dspine = if cfg.rank == 0 {
+            cfg.dspine_socket
+                .as_deref()
+                .map(|path| crate::dspine_socket::DspineSocket::connect(path, cfg.step_deadline))
+                .transpose()
+                .map_err(device_err("connecting DSpine sidecar"))?
+                .map(std::cell::RefCell::new)
+        } else {
+            None
+        };
         Some(AuxTap {
+            tree: None,
+            dspine,
+            capture_extra,
+            capture,
             plan,
             buf,
             rows,
@@ -7097,8 +7469,14 @@ fn run(
     // `Launcher` refuses a resize by name if anything tries.
     let launch_counters = LaunchCounters::new();
     let mut launcher = Launcher::new(format!("engine.r{}", cfg.rank), &launch_counters);
+    if let Some(comm) = &rccl {
+        launcher = launcher.with_rccl(std::rc::Rc::clone(comm));
+    }
     if let Some(p) = &peer {
         launcher = launcher.with_peer(Arc::clone(p));
+    }
+    if cfg.host_ar {
+        launcher = launcher.with_host_ar();
     }
     let capture_counters = Arc::new(CaptureCounters::new());
     let peer_capture = if cfg.world > 1 {
@@ -7524,10 +7902,7 @@ fn run(
         // P27-15e: the tree form's (10, 10) is no scheduled width -- its proposal is picked at the
         // scheduler's own width (the committed rows fit it), so it is not asked here.
         for p in plans.iter().filter(|p| {
-            p.phase == Phase::Decode
-                && !(spec_tree_arm(cfg).runs.is_tree()
-                    && p.rows == spec_tree_arm(cfg).runs.rows() as u32
-                    && p.width == p.rows)
+            p.phase == Phase::Decode && !matches!(p.plan.bucket, GraphBucket::DecodeTree { .. })
         }) {
             // A band's proposal is picked at (live, max width) like its rectangle's.
             let batch = p.batch;
@@ -7651,6 +8026,7 @@ fn run(
                     rows: p.rows,
                     width: 1,
                     samples,
+                    tree: false,
                     ragged: false,
                 }) {
                     *d += extra;
@@ -7806,6 +8182,19 @@ fn run(
             launcher.ipc_bytes(),
             "engine.ipc",
         )?;
+        if cfg.host_ar {
+            ledger
+                .release(Pool::HostPinned, "engine.collectives.host-cap")
+                .map_err(device_err("reconciling host collective pages"))?;
+            ledger
+                .reserve(
+                    Pool::HostPinned,
+                    "engine.collectives.host",
+                    launcher.host_ipc_bytes(),
+                )
+                .map_err(device_err("billing shared host collective pages"))?;
+            println!("hostcollectives rank {}: {} MiB registered shared pages; native exact kernels, no peer access", cfg.rank, launcher.host_ipc_bytes() >> 20);
+        }
         tracing::info!(
             rank = cfg.rank,
             collectives,
@@ -7826,15 +8215,9 @@ fn run(
     mark = Instant::now();
     // ---- P27-15e: the tree form's device half (both ranks) --------------------------------------
     if tree_runs {
-        let res = drafter.as_mut().ok_or_else(|| {
-            ForwardError::Device(
-                "the tree arm runs and no drafter is resident: the arm's boot law refuses this"
-                    .to_owned(),
-            )
-        })?;
         let tp = plans
             .iter()
-            .find(|p| p.phase == Phase::Decode && p.rows == tree_rows && p.width == tree_rows)
+            .find(|p| matches!(p.plan.bucket, GraphBucket::DecodeTree { .. }))
             .ok_or_else(|| ForwardError::Device("the tree form was not planned".to_owned()))?;
         // every attention layer's KV pool, in plan order (the compaction's `layer_base`)
         let mut bases: Vec<u64> = Vec::new();
@@ -7972,7 +8355,8 @@ fn run(
             .map_err(device_err("the tree flush's table"))?;
         // CMP27L (`--engine-b1-arms adv|all`): the per-layer advances as ONE launch over
         // `[layers]` tables of the same state / record bases, at the same strides.
-        let advance_layers = if cfg.b1_arms.adv_batch {
+        // Resolve the batched kernel from the exact record layout of its per-layer donor.
+        let advance_layers = if cfg.b1_arms.adv_batch && matches!(tree_rows, 10 | 16) {
             let d0 = advance.first().map(|a| a.0.clone()).ok_or_else(|| {
                 ForwardError::Device("--engine-b1-arms adv: no tree advance".to_owned())
             })?;
@@ -8041,7 +8425,7 @@ fn run(
                 .find(|p| {
                     p.phase == Phase::Decode
                         && !p.ragged
-                        && !(p.rows == tree_rows && p.width == tree_rows)
+                        && !matches!(p.plan.bucket, GraphBucket::DecodeTree { .. })
                         // CMP27AH: a plan whose pair is fused carries no replay launch of its own
                         && p.plan.steps.iter().any(|st| {
                             st.name().ends_with(".gdn.recurrent_update")
@@ -8066,7 +8450,7 @@ fn run(
         } else {
             None
         };
-        res.tree = Some(TreeDevice {
+        let tree = std::rc::Rc::new(TreeDevice {
             compact,
             layer_base,
             moves,
@@ -8078,7 +8462,7 @@ fn run(
             last: std::cell::RefCell::new(BTreeMap::new()),
             plans: std::cell::RefCell::new(Vec::new()),
             seqs: std::cell::RefCell::new(BTreeMap::new()),
-            counts: std::cell::RefCell::new([0; 11]),
+            counts: std::cell::RefCell::new([0; 12]),
             drawn: cfg.spec_tree_sampled,
             biased: cfg.spec_tree_sampled_control,
             last_path: std::cell::RefCell::new(Vec::new()),
@@ -8100,6 +8484,13 @@ fn run(
             replay_mat,
             materialized: std::cell::Cell::new(0),
         });
+        aux_tap
+            .as_mut()
+            .expect("tree verifier requires target feature taps")
+            .tree = Some(tree.clone());
+        if let Some(res) = drafter.as_mut() {
+            res.tree = Some(tree);
+        }
     }
     // ---- the captured decode buckets -------------------------------------------------------------
     let mut captured: Vec<(StepRows, CapturedBucket)> = Vec::new();
@@ -8109,12 +8500,19 @@ fn run(
         // entry per pair, and its `rows` is `batch * width`.
         // A ROW BAND is a shape of its own (C2): its key carries `ragged`, because the 40-row band at
         // max width 8 and `b5s8` share (rows, width) and are different graphs.
-        let decode_shapes: Vec<(u32, u32, bool)> = plans
+        let decode_shapes: Vec<(u32, u32, bool, bool)> = plans
             .iter()
             .filter(|p| p.phase == Phase::Decode)
-            .map(|p| (p.rows, p.width, p.ragged))
+            .map(|p| {
+                (
+                    p.rows,
+                    p.width,
+                    p.ragged,
+                    matches!(p.plan.bucket, GraphBucket::DecodeTree { .. }),
+                )
+            })
             .collect();
-        for (rows, width, ragged) in decode_shapes {
+        for (rows, width, ragged, tree) in decode_shapes {
             let body = plans
                 .iter()
                 .find(|p| {
@@ -8122,6 +8520,7 @@ fn run(
                         && p.rows == rows
                         && p.width == width
                         && p.ragged == ragged
+                        && (matches!(p.plan.bucket, GraphBucket::DecodeTree { .. }) == tree)
                 })
                 .ok_or_else(|| {
                     ForwardError::Device(format!("no decode body at {rows} rows, width {width}"))
@@ -8135,6 +8534,7 @@ fn run(
                 rows,
                 width,
                 samples: true,
+                tree,
                 ragged,
             };
             let want = declared.get(&shape).copied().unwrap_or(0);
@@ -8233,7 +8633,7 @@ fn run(
                 )));
             }
             let want = res.shapes[ix].plan.captured_launches();
-            if bucket.node_count() != want as usize || bucket.declared_launches() != want {
+            if bucket.kernel_node_count() != want as usize || bucket.declared_launches() != want {
                 return Err(ForwardError::Device(format!(
                     "the drafter's backbone at {reqs} request(s) captured {} node(s) and {} \
                      declared launch(es) against a budget of {want}",
@@ -8265,7 +8665,7 @@ fn run(
                 )
                 .map_err(device_err("capturing the drafter's tail"))?;
                 let want = res.shapes[ix].plan.tail_launches();
-                if b.node_count() != want as usize || b.declared_launches() != want {
+                if b.kernel_node_count() != want as usize || b.declared_launches() != want {
                     return Err(ForwardError::Device(format!(
                         "the drafter's tail at {reqs} request(s) captured {} node(s) and {} \
                          declared launch(es) against a budget of {want}",
@@ -8378,6 +8778,7 @@ fn run(
         max_ctx: cfg.max_ctx,
         max_blocks,
         block_size,
+        state_width: max_width,
     };
     let host_gathers = Arc::new(AtomicU64::new(0));
     // THE PER-STEP HOST CLOCK (ws-h31). Armed from the config so that rank 1, which has no handle
@@ -8464,7 +8865,11 @@ fn run(
         gdn_bytes_per_slot,
         decode_shapes: plans
             .iter()
-            .filter(|p| p.phase == Phase::Decode && !p.ragged)
+            .filter(|p| {
+                p.phase == Phase::Decode
+                    && !p.ragged
+                    && !(dspine && matches!(p.plan.bucket, GraphBucket::DecodeTree { .. }))
+            })
             .map(|p| (p.rows / p.width, p.width))
             .collect(),
         max_width,
@@ -8538,7 +8943,7 @@ fn run(
         }),
         aux_tap: aux_tap.as_ref().map(|t| crate::forward::AuxTapFacts {
             layers: t.plan.layers.clone(),
-            launches: t.plan.launches(),
+            launches: t.launches(),
             rows: t.rows,
             bytes: t.plan.bytes(t.rows),
         }),
@@ -8810,9 +9215,9 @@ fn run(
                     par,
                 } => {
                     // CMP27G: this rank's half of the leader's materialize before a tree step.
-                    let mat = drafter
+                    let mat = aux_tap
                         .as_ref()
-                        .and_then(|r| r.tree.as_ref())
+                        .and_then(|tap| tap.tree.as_deref())
                         .and_then(|t| t.replay_mat.as_ref().map(|m| (t, m)))
                         .ok_or_else(|| {
                             ForwardError::Peer(
@@ -9089,6 +9494,7 @@ fn run(
                     slot,
                     defer_proposals,
                     ragged,
+                    tree,
                 } => {
                     let runs = pending_scatter.take();
                     if runs.is_some() && phase != Phase::Prefill {
@@ -9140,6 +9546,7 @@ fn run(
                         seam_penalties,
                         slot,
                         ragged,
+                        tree,
                         &blob[..carried],
                         aux_tap.as_ref(),
                         drafter.as_ref(),
@@ -9281,7 +9688,7 @@ fn run(
             cfg.rank,
             lever_counts.line(cfg.host_levers)
         );
-        if let Some(t) = drafter.as_ref().and_then(|r| r.tree.as_ref()) {
+        if let Some(t) = aux_tap.as_ref().and_then(|tap| tap.tree.as_deref()) {
             println!("{}", t.line(cfg.rank));
         }
         if let Some(r) = drafter.as_ref() {
@@ -9672,6 +10079,11 @@ fn run(
                         }
                     }
                 }
+                if let Some(socket) = aux_tap.as_ref().and_then(|tap| tap.dspine.as_ref()) {
+                    if let Err(error) = socket.borrow_mut().clear(seq) {
+                        tracing::error!(%seq, %error, "clearing DSpine sequence");
+                    }
+                }
                 restoring_image.remove(&seq);
                 if let Some(s) = sessions.remove(&seq) {
                     free_slots.push(s.slot);
@@ -9761,6 +10173,7 @@ fn run(
                     prefill_proposal,
                     defer,
                     &mut pending,
+                    aux_tap.as_ref().filter(|t| t.dspine.is_some()),
                     // THE DRAFTER'S HALF OF A PREFILL CHUNK (ws-s8): the prompt's context, stored
                     // into the drafter's own cache the way prod's `propose` stores it after every
                     // target step. `None` on every run without a resident drafter, which is the
@@ -10396,6 +10809,7 @@ fn run(
                             prefill_proposal,
                             defer,
                             &mut pending,
+                            aux_tap.as_ref().filter(|t| t.dspine.is_some()),
                             drafter
                                 .as_ref()
                                 .zip(aux_tap.as_ref())
@@ -10625,6 +11039,7 @@ fn run(
                     draft_tier.as_ref(),
                     link.as_mut(),
                     geom.max_ctx,
+                    max_width,
                     &draft_counts,
                     &host_trace,
                 );
@@ -10737,7 +11152,10 @@ fn run(
                         .map(|h| (h, Phase::Decode)),
                 };
                 // P27-W2-3: after a tree step, depth `j`'s row is the accepted path's `j`th.
-                let row = match (last_head, drafter.as_ref().and_then(|r| r.tree.as_ref())) {
+                let row = match (
+                    last_head,
+                    aux_tap.as_ref().and_then(|tap| tap.tree.as_deref()),
+                ) {
                     (LastHead::Decode(_), Some(t)) => t
                         .last_path
                         .borrow()
@@ -10829,7 +11247,7 @@ fn run(
             lever_counts.line(cfg.host_levers)
         );
     }
-    if let Some(t) = drafter.as_ref().and_then(|r| r.tree.as_ref()) {
+    if let Some(t) = aux_tap.as_ref().and_then(|tap| tap.tree.as_deref()) {
         println!("{}", t.line(cfg.rank));
     }
     if cfg.step_arms.treeblob {
@@ -11893,7 +12311,7 @@ struct DraftResident {
     /// `ancestor9` when the arm fell back and only counts plans).
     spec_tree_form: crate::spec_tree::SpecTreeForm,
     /// P27-15e: the tree form's device half, when the arm runs.
-    tree: Option<TreeDevice>,
+    tree: Option<std::rc::Rc<TreeDevice>>,
     /// P27-W2-2: the device candidate seam's window + scratch (`--engine-device-step cand`).
     cand: Option<CandSeam>,
     /// P27-W2-2: the form, and its end-of-run counters (`devstep27 rank R:`).
@@ -12746,7 +13164,7 @@ struct ConvCommit {
 }
 
 type TreeTables = BTreeMap<i32, (Vec<u16>, Vec<i64>)>;
-type TreePlans = Vec<Option<(Vec<TokenId>, crate::spec_tree::TreePlan)>>;
+type TreePlans = Vec<Option<crate::spec_tree_step::NativeTreeOffer>>;
 type TreeSeqs = BTreeMap<
     SeqId,
     (
@@ -12782,7 +13200,7 @@ struct TreeDevice {
     /// Counters: tree steps, nodes verified, accepted depth, lattice / chain plans, prologues
     /// (acc >= 0), compactions launched, rows moved, aux gathers, rows gathered, drawn walks
     /// (P27-W2-3: the lattice plans a SAMPLED slot committed by the drawn tree law).
-    counts: std::cell::RefCell<[u64; 11]>,
+    counts: std::cell::RefCell<[u64; 12]>,
     /// **P27-W2-3** (`--engine-spec-tree-sampled on`): a sampled slot verifies its lattice plan
     /// under the drawn tree law, and every tree step with sampled rows sends (leader) / takes
     /// (follower) the accepted path (`tree.path`) for the aux gather. Both ranks.
@@ -12928,6 +13346,7 @@ impl TreeDevice {
             launcher
                 .launch(ctx, d, &a, stream)
                 .map_err(|e| ForwardError::Device(format!("the batched tree advance: {e}")))?;
+            self.counts.borrow_mut()[11] += 1;
             self.last_path.replace(o.path.clone());
             return Ok(());
         }
@@ -12942,6 +13361,7 @@ impl TreeDevice {
                 .launch(ctx, d, &a, stream)
                 .map_err(|e| ForwardError::Device(format!("the tree advance: {e}")))?;
         }
+        self.counts.borrow_mut()[11] += 1;
         self.last_path.replace(o.path.clone());
         Ok(())
     }
@@ -13102,7 +13522,7 @@ impl TreeDevice {
         format!(
             "spectree  rank {rank}: tree steps {} nodes/step {:.2} accepted depth/step {:.2}, \
              lattice plans {} chain plans {}, prologues {}, compactions {} ({} rows moved), aux \
-             gathers {} ({} rows), drawn walks {}, flushes 0 (b1-only boot){}",
+             gathers {} ({} rows), drawn walks {}, flushes {}{}",
             c[0],
             per(c[1]),
             per(c[2]),
@@ -13114,6 +13534,7 @@ impl TreeDevice {
             c[8],
             c[9],
             c[10],
+            c[11],
             if self.replay_mat.is_some() {
                 format!(
                     "; GDN replay composed: materializes {} (CMP27G)",
@@ -13139,6 +13560,14 @@ impl TreeDevice {
 /// class, the drafter's lattice read and the report agree.
 #[must_use]
 pub fn spec_tree_arm(cfg: &EngineConfig) -> crate::spec_tree_step::ArmResolution {
+    if cfg.dspine_socket.is_some() && cfg.spec_tree == crate::spec_tree::SpecTreeForm::Best16 {
+        return crate::spec_tree_step::ArmResolution {
+            asked: cfg.spec_tree,
+            runs: cfg.spec_tree,
+            refused: None,
+            plans: true,
+        };
+    }
     crate::spec_tree_step::resolve_arm(
         cfg.spec_tree,
         crate::spec_tree_step::ArmContext {
@@ -14804,6 +15233,7 @@ fn propose_after_prefill(
         res,
         tap,
         &frame,
+        Some((seq, done_before + committed, fed)),
         link.as_deref_mut(),
         vocab,
         counts,
@@ -14834,6 +15264,7 @@ fn propose_block(
     res: &DraftResident,
     tap: &AuxTap,
     frame: &[u8],
+    owner: Option<(SeqId, u32, TokenId)>,
     mut link: Option<&mut RankLink>,
     vocab: u32,
     counts: &DraftCounters,
@@ -15516,7 +15947,11 @@ fn propose_block(
                 if let (Some(t), Some(Ok(p))) = (&res.tree, plan.as_ref()) {
                     t.plans
                         .borrow_mut()
-                        .push(Some((block_ids.clone(), p.clone())));
+                        .push(Some(crate::spec_tree_step::NativeTreeOffer {
+                            owner,
+                            chain: block_ids.clone(),
+                            plan: p.clone(),
+                        }));
                 } else if let Some(t) = &res.tree {
                     t.plans.borrow_mut().push(None);
                 }
@@ -15894,34 +16329,51 @@ fn insert_aux_taps<'a>(
     let base = body.exec.arena_base();
     let layers = tap.layers_in_model;
     // The op each copy follows -> which taps go after it.
-    let mut after: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for k in 0..tap.plan.layers.len() {
-        let mut op = tap.plan.after(k, mode, layers)?;
-        // ws-h37: under `--decode-fusion` the op the tap follows (`input_layernorm`) is FOLDED
-        // into the reduce before it (`_nq`), so it issues nothing and has no bound step: the copy
-        // follows the dispatch that now writes the edge. A fused route names that dispatch --
-        // since ws-h38 (fusion-map row 3) that is the PREVIOUS layer's `down_proj` GEMM, whose
-        // row owners write the norm's `res_out`; the reduce between them is fused into it too.
-        if let Some(saber_exec::Route::Fused { into, .. }) = body
-            .plan
-            .steps
-            .iter()
-            .find(|s| s.name() == op)
-            .map(|s| &s.route)
-        {
-            op = into.clone();
-        }
-        after.entry(op).or_default().push(k);
+    let mut planes = vec![(&tap.plan, &tap.buf)];
+    if let Some((p, b)) = &tap.capture_extra {
+        planes.push((p, b));
     }
-    let mut out: Vec<BoundStep<'a>> = Vec::with_capacity(steps.len() + tap.plan.layers.len());
+    let mut after: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+    for (plane, (plan, _)) in planes.iter().enumerate() {
+        for k in 0..plan.layers.len() {
+            let mut op = plan.after(k, mode, layers)?;
+            // ws-h37: under `--decode-fusion` the op the tap follows (`input_layernorm`) is FOLDED
+            // into the reduce before it (`_nq`), so it issues nothing and has no bound step: the copy
+            // follows the dispatch that now writes the edge. A fused route names that dispatch --
+            // since ws-h38 (fusion-map row 3) that is the PREVIOUS layer's `down_proj` GEMM, whose
+            // row owners write the norm's `res_out`; the reduce between them is fused into it too.
+            if let Some(saber_exec::Route::Fused { into, .. }) = body
+                .plan
+                .steps
+                .iter()
+                .find(|s| s.name() == op)
+                .map(|s| &s.route)
+            {
+                op = into.clone();
+            }
+            after.entry(op).or_default().push((plane, k));
+        }
+    }
+    let mut out: Vec<BoundStep<'a>> = Vec::with_capacity(steps.len() + tap.launches() as usize);
     let mut placed = 0usize;
     for step in steps {
         let ks = after.get(step.name).cloned().unwrap_or_default();
         out.push(step);
-        for k in ks {
+        for (plane, k) in ks {
+            let (plan, buffer) = planes[plane];
             let mut a = ArgBindings::new(Shape::new(0, 0, 0));
-            a.bind("src", at(&body.plan, base, &tap.plan.edges[k])?);
-            a.bind("out", tap.out(k)?);
+            a.bind("src", at(&body.plan, base, &plan.edges[k])?);
+            a.bind(
+                "out",
+                if plane == 0 {
+                    tap.out(k)?
+                } else {
+                    buffer
+                        .addr()
+                        .offset(plan.block_offset(k))
+                        .ok_or_else(|| ForwardError::Device("capture tap offset overflow".into()))?
+                },
+            );
             out.push(BoundStep {
                 name: "draft.aux_tap",
                 descs: std::slice::from_ref(desc),
@@ -15930,11 +16382,11 @@ fn insert_aux_taps<'a>(
             placed += 1;
         }
     }
-    if placed != tap.plan.layers.len() {
+    if placed != tap.launches() as usize {
         return Err(ForwardError::Device(format!(
             "the aux tap placed {placed} of its {} copies: an op it names is not in this plan's \
              bound step list, so the drafter would read whatever `aux.cat` held",
-            tap.plan.layers.len()
+            tap.launches()
         )));
     }
     Ok(out)
@@ -15995,8 +16447,9 @@ fn capture_step(
         counters,
     )
     .map_err(device_err("capturing the step"))?;
-    // Rule 7, at capture: the node count IS the declared budget for this shape.
-    if bucket.declared_launches() != want || bucket.node_count() != want as usize {
+    // Rule 7: compute nodes match this shape's launch budget. CapturedBucket has
+    // separately audited any external RCCL completion-event nodes.
+    if bucket.declared_launches() != want || bucket.kernel_node_count() != want as usize {
         return Err(ForwardError::Device(format!(
             "capture `{shape}`: {} nodes and {} declared launches against a budget of {want}",
             bucket.node_count(),
@@ -19260,6 +19713,7 @@ fn prefill_step(
     // rather than run it here from the argmax. `stash` is where it goes.
     defer: bool,
     stash: &mut Option<PendingProposal>,
+    socket_tap: Option<&AuxTap>,
     // The resident drafter, its tap and the tier that holds this sequence's drafter pages — the
     // three things the PROMPT's context store needs, and all three or none.
     drafter: Option<(&DraftResident, &AuxTap, &crate::draft_tier::DraftTier)>,
@@ -19470,6 +19924,7 @@ fn prefill_step(
         rows,
         width: 1,
         samples: last,
+        tree: false,
         ragged: false,
     };
     let mut link = link;
@@ -19503,6 +19958,7 @@ fn prefill_step(
                 // proposal, if it makes one, waits for a `Propose` after the host sampler.
                 defer_proposals: defer && drafter.is_some(),
                 ragged: false,
+                tree: false,
             },
             indices.frame(),
         )?;
@@ -19544,7 +20000,7 @@ fn prefill_step(
         ProbeDepth::Layers,
         // THE PREFILL IS TAPPED NOW (ws-s8). See `tap_for`: the drafter's context store runs over
         // the prompt, so the prompt's five tapped edges have to reach `aux.cat`.
-        tap_for(body, drafter.map(|(_, t, _)| t)),
+        tap_for(body, socket_tap.or_else(|| drafter.map(|(_, t, _)| t))),
         None,
         trace,
         scatter.as_ref(),
@@ -19629,7 +20085,19 @@ fn prefill_step(
     // `PAD_SLOT`, exactly as `DraftCtxTile::chunk` does) and the aux window is the same `row0`.
     let mut prefill_block: Vec<TokenId> = Vec::new();
     let mut prefill_pending: Vec<SeqId> = Vec::new();
+    if let Some(tap) = socket_tap {
+        tap.capture_rows(hip, stream, seq, done, tokens, 0, "prefill")?;
+        if last && prefill_proposal {
+            prefill_pending.push(seq);
+            *stash = Some(PendingProposal::Dspine {
+                seq,
+                position: done + live_rows,
+                vocab: vocab_total,
+            });
+        }
+    }
     if let Some((res, t, tier)) = drafter {
+        t.capture_rows(hip, stream, seq, done, tokens, 0, "prefill")?;
         let block = res.cfg.block_size;
         let geom_d = crate::draft_inputs::DraftGeometry {
             block,
@@ -19966,6 +20434,7 @@ fn ar_families_of(p: &Planned<'_>) -> Vec<(StepRows, String, u32)> {
         rows: p.rows,
         width: p.width,
         samples: true,
+        tree: matches!(p.plan.bucket, GraphBucket::DecodeTree { .. }),
         ragged: p.ragged,
     };
     let mut by_op: BTreeMap<String, u32> = BTreeMap::new();
@@ -20006,6 +20475,7 @@ fn bucket_ops_of(p: &Planned<'_>) -> Vec<(StepRows, String, String, u32)> {
         rows: p.rows,
         width: p.width,
         samples: true,
+        tree: matches!(p.plan.bucket, GraphBucket::DecodeTree { .. }),
         ragged: p.ragged,
     };
     let mut by: BTreeMap<(String, String), u32> = BTreeMap::new();
@@ -20051,6 +20521,12 @@ fn planned_widths(asked: &[u32]) -> Result<Vec<u32>, ForwardError> {
 /// `aux.cat`, which nothing writes until the next forward.
 #[derive(Debug)]
 enum PendingProposal {
+    /// Features have reached the external proposer; wait for the host-sampled anchor.
+    Dspine {
+        seq: SeqId,
+        position: u32,
+        vocab: u32,
+    },
     /// A decode step's batch: `(sequence, done_before, committed, argmax)` per live slot, in slot
     /// order. The argmax is kept only for the log line of a stash that was abandoned.
     Decode {
@@ -20100,7 +20576,9 @@ impl PendingProposal {
     fn seqs(&self) -> Vec<SeqId> {
         match self {
             PendingProposal::Decode { reqs, .. } => reqs.iter().map(|r| r.0).collect(),
-            PendingProposal::Prefill { seq, .. } => vec![*seq],
+            PendingProposal::Prefill { seq, .. } | PendingProposal::Dspine { seq, .. } => {
+                vec![*seq]
+            }
             PendingProposal::Queued { first, .. } => first.seqs(),
         }
     }
@@ -20286,6 +20764,7 @@ fn collect_proposal(
     tier: Option<&crate::draft_tier::DraftTier>,
     mut link: Option<&mut RankLink>,
     max_ctx: u32,
+    max_verify_width: u32,
     counts: &DraftCounters,
     trace: &HostTrace,
 ) -> Result<Vec<Proposal>, ForwardError> {
@@ -20302,6 +20781,32 @@ fn collect_proposal(
             "the proposal was stashed for {stashed:?} and the anchors name {:?}",
             anchors.iter().map(|a| a.0).collect::<Vec<_>>()
         )));
+    }
+    if let PendingProposal::Dspine {
+        seq,
+        position,
+        vocab,
+    } = *p
+    {
+        pending.take();
+        let tree = tap.is_some_and(|t| t.tree.is_some());
+        let socket = tap.and_then(|t| t.dspine.as_ref()).ok_or_else(|| {
+            ForwardError::Device("missing DSpine sidecar for pending proposal".into())
+        })?;
+        let anchor = anchors[0].1;
+        let width = max_verify_width
+            .saturating_sub(1)
+            .min(max_ctx.saturating_sub(position.saturating_add(1)));
+        let block = socket
+            .borrow_mut()
+            .propose(seq, position, anchor, width, vocab, tree && width == 15)
+            .map_err(device_err("collecting DSpine draft"))?;
+        counts.proposals.fetch_add(1, Ordering::Relaxed);
+        counts
+            .tokens
+            .fetch_add(block.len() as u64, Ordering::Relaxed);
+        counts.after_commit.fetch_add(1, Ordering::Relaxed);
+        return Ok(vec![Proposal { seq, anchor, block }]);
     }
     let (Some(res), Some(t), Some(tier)) = (drafter, tap, tier) else {
         abandon_pending(pending, counts, "no resident drafter");
@@ -20442,6 +20947,9 @@ fn collect_proposal(
             )
             .map(|p| vec![p])
         }
+        PendingProposal::Dspine { .. } => Err(ForwardError::Device(
+            "external proposal reached the native collector".into(),
+        )),
         PendingProposal::Queued { .. } => Err(ForwardError::Device(
             "a queued proposal inside a queued proposal: a fused step stashes two at most"
                 .to_owned(),
@@ -20568,7 +21076,7 @@ fn decode_step(
     // lattice plan when the scheduler's draft is the walk's block and the slot is greedy, else the
     // scheduler's own draft as a chain plan (chain words: no compaction, contiguous aux rows), so
     // a sequence never takes a chain step after a tree step (that flush is R2's).
-    let tree_dev = drafter.and_then(|(r, _)| r.tree.as_ref());
+    let tree_dev = tap.and_then(|t| t.tree.as_deref());
     // AN IMAGE SEQUENCE takes the chain form: the tree's rope is by depth on TEXT positions and an
     // M-RoPE table is not, so it used to be refused by name and the client saw `finish_reason:
     // abort`. The follower tells a tree step from a chain one by the plan's shape, and a sequence
@@ -20578,6 +21086,40 @@ fn decode_step(
             .get(&slots[0].seq)
             .is_some_and(|session| session.images.is_some());
     let tree_plan: Option<(crate::spec_tree::TreePlan, bool)> = match tree_dev {
+        Some(device) if tap.is_some_and(|tap| tap.dspine.is_some()) => {
+            // The external offer belongs only to this committed anchor and scheduler block.
+            let s = &slots[0];
+            let plan = tap.and_then(|tap| tap.dspine.as_ref()).and_then(|socket| {
+                socket
+                    .borrow_mut()
+                    .take_tree(s.seq, s.context_len, s.input, &s.draft)
+            });
+            let selected = plan.filter(|_| {
+                !image_seq
+                    && band.is_none()
+                    && batch == 1
+                    && slots.len() == 1
+                    && width == device.rows as u32
+                    && geom.max_ctx.saturating_sub(s.context_len) >= device.rows as u32
+                    && (s.decider.is_none() || device.drawn)
+            });
+            if selected.is_none() {
+                device.last_path.borrow_mut().clear();
+            }
+            selected.map(|p| (p, true))
+        }
+        Some(t)
+            if slots.len() == 1
+                && drafter.is_some_and(|(res, _)| res.cfg.block_size == 16)
+                && (width != t.rows as u32
+                    || geom.max_ctx.saturating_sub(slots[0].context_len) < t.rows as u32) =>
+        {
+            // The scheduler selected a narrow step (e.g. at the context limit).
+            // Do not promote it back to a full tree with out-of-range KV slots.
+            t.plans.borrow_mut().clear();
+            t.last_path.borrow_mut().clear();
+            None
+        }
         Some(t) if image_seq && band.is_none() && batch == 1 => {
             // Drained so the queued lattice plan does not meet the next step.
             t.plans.borrow_mut().drain(..).next();
@@ -20588,20 +21130,32 @@ fn decode_step(
             let lattice = t.plans.borrow_mut().drain(..).next().flatten();
             let lattice = lattice
                 // P27-W2-3: a SAMPLED slot takes its lattice plan too under the drawn law.
-                .filter(|(block, _)| (s.decider.is_none() || t.drawn) && *block == s.draft)
-                .map(|(_, p)| p.with_anchor(i64::from(s.input)));
+                .filter(|_| s.decider.is_none() || t.drawn)
+                .and_then(|offer| {
+                    offer.for_step(
+                        s.seq,
+                        s.context_len,
+                        s.input,
+                        &s.draft,
+                        drafter.is_some_and(|(res, _)| res.cfg.block_size == 16),
+                    )
+                });
             match lattice {
                 Some(p) => Some((p, true)),
                 None => {
                     let rid = s.row_ids();
-                    let p = crate::spec_tree_step::draft_chain_plan(rid[0], &rid[1..]).map_err(
-                        |e| {
-                            ForwardError::Device(format!(
-                                "{}: the tree form's chain plan: {e}",
-                                s.seq
-                            ))
-                        },
-                    )?;
+                    let positions = drafter
+                        .map_or(crate::spec_tree::DRAFT_POSITIONS, |(res, _)| {
+                            res.cfg.selector_positions()
+                        });
+                    let p = crate::spec_tree_step::draft_chain_plan_limited(
+                        rid[0],
+                        &rid[1..],
+                        positions.min(t.rows as u32 - 1),
+                    )
+                    .map_err(|e| {
+                        ForwardError::Device(format!("{}: the tree form's chain plan: {e}", s.seq))
+                    })?;
                     Some((p, false))
                 }
             }
@@ -20669,6 +21223,7 @@ fn decode_step(
                 && p.rows == rows
                 && p.width == width
                 && p.ragged == ragged
+                && (matches!(p.plan.bucket, GraphBucket::DecodeTree { .. }) == tree_plan.is_some())
                 && (!ragged || p.batch == batch)
         })
         .ok_or(ForwardError::NoPlan {
@@ -20838,7 +21393,9 @@ fn decode_step(
         ids: &ids,
         committed_before: &committed_before,
         band_width: band.map(|_| width),
-    };
+    }
+    .with_scalar_snapshot_span(geom.state_width)
+    .map_err(|error| ForwardError::Device(error.to_string()))?;
     // A DECODE STEP'S ATTENTION IS ITS BUCKET'S: every live slot feeds the verify width (a shorter
     // one is refused above), so the chunk's rows and the bucket's are one number and `Live` is the
     // reading. `attn_decode` refuses any other, because there `q_len` is also the `sidx` block
@@ -20892,6 +21449,7 @@ fn decode_step(
         rows,
         width,
         samples: true,
+        tree: tree_plan.is_some(),
         ragged,
     };
     // The seam's inputs for every ROW of this step: a slot's `width` rows carry that slot's own
@@ -20992,6 +21550,7 @@ fn decode_step(
                 slot: 0,
                 // ws-f37: the proposal frames wait for a `Propose` — the committed anchors are
                 // decided on this rank's host after the picks and the seam have crossed.
+                tree: tree_plan.is_some(),
                 defer_proposals: defer && drafter.is_some() && tap.is_some() && tap_gate.is_none(),
             },
             indices.frame(),
@@ -21183,7 +21742,7 @@ fn decode_step(
             peer_seam.as_ref(),
             law,
             sessions,
-            drafter.is_some(),
+            drafter.is_some() || tap.is_some_and(|t| t.dspine.is_some()),
             draft_counts,
             slot_counts,
         )?,
@@ -21220,8 +21779,53 @@ fn decode_step(
     // committed the model's own tokens, and a drafter that could not run costs a narrower next
     // step, never a wrong one.
     trace.stop(HostPhase::Accept, t_accept);
+    if let Some(t) = tap {
+        if t.capture.is_some() || t.dspine.is_some() {
+            if slots.len() != 1
+                || (t.capture.is_some() && tree_plan.is_some())
+                || tap_gate.is_some()
+            {
+                return Err(ForwardError::Device(
+                    "feature export requires a single compatible target step".into(),
+                ));
+            }
+            let slot = &slots[0];
+            let committed = commits
+                .first()
+                .ok_or_else(|| ForwardError::Device("missing target verdict".into()))?;
+            if committed.tokens.len() != committed.accepted as usize + 1 {
+                return Err(ForwardError::Device(
+                    "target verdict has an invalid committed input count".into(),
+                ));
+            }
+            // post_path gathered the primary tap plane along the winning branch on both ranks.
+            // The last sampled (bonus) token is the NEXT anchor and has no target feature row yet.
+            let mut inputs = vec![slot.input];
+            inputs.extend_from_slice(&committed.tokens[..committed.accepted as usize]);
+            t.capture_rows(
+                hip,
+                stream,
+                slot.seq,
+                slot.context_len,
+                &inputs,
+                starts[0],
+                "decode",
+            )?;
+        }
+    }
+
     let mut drafts: Vec<Vec<TokenId>> = Vec::new();
     let mut proposal_pending: Vec<SeqId> = Vec::new();
+    if tap.is_some_and(|t| t.dspine.is_some()) {
+        let slot = &slots[0];
+        let position = slot.context_len + commits[0].tokens.len() as u32;
+        proposal_pending.push(slot.seq);
+        *stash = Some(PendingProposal::Dspine {
+            seq: slot.seq,
+            position,
+            vocab: vocab_total,
+        });
+    }
     if let (Some((res, tier)), Some(t), None) = (drafter, tap, tap_gate) {
         if defer {
             // PROD'S ORDER (ws-f37): the inputs are stashed and the proposal runs once the host
@@ -21338,7 +21942,6 @@ fn replay_rewrite_plans(
                 .to_owned(),
         ));
     }
-    let tree_rows = if arm.is_tree() { arm.rows() as u32 } else { 0 };
     if !cfg.gdn_state_f16 {
         return Err(ForwardError::Device(
             "--engine-gdn-replay on needs the f16 stored GDN state (the replay form is built for \
@@ -21347,10 +21950,9 @@ fn replay_rewrite_plans(
         ));
     }
     let mut layers = BTreeSet::new();
-    for p in plans
-        .iter_mut()
-        .filter(|p| p.phase == Phase::Decode && !(p.rows == tree_rows && p.width == tree_rows))
-    {
+    for p in plans.iter_mut().filter(|p| {
+        p.phase == Phase::Decode && !matches!(p.plan.bucket, GraphBucket::DecodeTree { .. })
+    }) {
         layers.extend(
             crate::gdn_replay::rewrite_plan_as(&mut p.plan, max_width, cfg.c4_arms.replay_lds)
                 .map_err(|e| ForwardError::Device(format!("{e} (P27-W2-5)")))?,
@@ -22190,6 +22792,10 @@ fn step_proposal(
                     res,
                     t,
                     &frame,
+                    match proposals {
+                        [(seq, done, committed, anchor)] => Some((*seq, done + committed, *anchor)),
+                        _ => None,
+                    },
                     link.as_deref_mut(),
                     // The WHOLE vocabulary: at two ranks the walk's ids are global.
                     vocab_total,
@@ -22262,6 +22868,11 @@ fn step_proposal(
                                     res,
                                     t,
                                     &rframe,
+                                    Some((
+                                        proposals[i].0,
+                                        proposals[i].1 + proposals[i].2,
+                                        proposals[i].3,
+                                    )),
                                     link.as_deref_mut(),
                                     vocab_total,
                                     draft_counts,
@@ -22706,6 +23317,7 @@ fn follow_step(
     state_slot: u32,
     // A decode ROW BAND (C2): the leader's `Command::Step::ragged`.
     ragged: bool,
+    tree: bool,
     blob: &[u8],
     tap: Option<&AuxTap>,
     // THE FOLLOWER'S HALF OF THE DRAFTER. `Some` when this rank made the tier resident, which at
@@ -22746,7 +23358,11 @@ fn follow_step(
     let which = plans
         .iter()
         .position(|p| {
-            p.phase == phase && p.rows == rows && p.width == want_width && p.ragged == ragged
+            p.phase == phase
+                && p.rows == rows
+                && p.width == want_width
+                && p.ragged == ragged
+                && (matches!(p.plan.bucket, GraphBucket::DecodeTree { .. }) == tree)
         })
         .ok_or(ForwardError::NoPlan {
             phase,
@@ -22768,6 +23384,7 @@ fn follow_step(
         rows,
         width: want_width,
         samples,
+        tree,
         ragged,
     };
     if phase == Phase::Prefill && samples {
@@ -22849,12 +23466,7 @@ fn follow_step(
         &[]
     };
     // P27-15e: the tree form's compaction of the previous tree step (from the blob's `acc`).
-    let tree_here = phase == Phase::Decode
-        && drafter
-            .and_then(|r| r.tree.as_ref())
-            .is_some_and(|t| plans[which].rows == t.rows as u32)
-        && plans[which].width == plans[which].rows;
-    let tree_dev = drafter.and_then(|r| r.tree.as_ref()).filter(|_| tree_here);
+    let tree_dev = tap.and_then(|tap| tap.tree.as_deref()).filter(|_| tree);
     if let Some(t) = tree_dev {
         t.pre_step(hip, ctx, launcher, stream, indices.host.as_slice())?;
     }
@@ -23225,6 +23837,7 @@ fn follow_proposals(
             res,
             tap,
             &frame,
+            None,
             Some(link),
             vocab,
             draft_counts,
