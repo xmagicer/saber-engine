@@ -1,0 +1,21 @@
+profile,workload,target_tok_s,mean_full_window_tok_s,max_full_window_tok_s,percent_of_observable_time_at_target,longest_excursion_seconds
+Earlier NV baseline,code,300,199.6389,266,0.0,0.0
+Earlier NV baseline,prose,200,157.3368,200,0.0468,0.0077
+Quark B8 INT2,code,300,224.4911,322,2.1235,0.2001
+Quark B8 INT2,prose,200,163.2891,211,2.0773,0.1477
+"Quark B8 full FP8, managed",code,300,226.504,336,5.5192,0.2421
+"Quark B8 full FP8, managed",prose,200,166.7943,211,1.5508,0.0829
+"Quark B16 calibrated, 1 slot",code,300,229.0648,345,12.1049,0.5445
+"Quark B16 calibrated, 1 slot",prose,200,160.6813,304,7.1213,1.1491
+Quark+B8/B9/B10 INT2 one slot b10,code,300,223.198,378,6.5479,0.3421
+Quark+B8/B9/B10 INT2 one slot b10,prose,200,157.8837,191,0.0,0.0
+Quark+B8/B9/B10 INT2 one slot b9,code,300,227.3963,339,6.8581,0.5276
+Quark+B8/B9/B10 INT2 one slot b9,prose,200,166.032,326,9.2668,1.3824
+Quark+B8/B9/B10 full head one slot b10,code,300,212.7742,350,8.3579,0.9296
+Quark+B8/B9/B10 full head one slot b10,prose,200,163.9045,211,1.1493,0.0893
+Quark+B8/B9/B10 full head one slot b9,code,300,240.1448,344,7.1552,0.4567
+Quark+B8/B9/B10 full head one slot b9,prose,200,165.285,209,3.3896,0.2919
+Quark+B9 eight-slot validation b9,code,300,224.8133,332,5.5499,0.4226
+Quark+B9 eight-slot validation b9,prose,200,164.4708,207,1.3827,0.1352
+Quark+B9 eight-slot validation b9-b,code,300,236.6115,332,6.0083,0.3328
+Quark+B9 eight-slot validation b9-b,prose,200,156.9127,207,2.2454,0.1414

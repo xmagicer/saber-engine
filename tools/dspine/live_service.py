@@ -165,7 +165,7 @@ class ProposalInputs:
 
 class ProposalHead(ProposalInputs):
     """DSpine target embeddings, int2 candidate selection and serial refinement."""
-    def __init__(self, target, model, draft_pack, prebuilt, device, *, gpu_tree=False):
+    def __init__(self, target, model, draft_pack, prebuilt, device, *, gpu_tree=False, sparse_shard=None):
         import native_head
         import triton_tail
 
@@ -177,7 +177,7 @@ class ProposalHead(ProposalInputs):
             self.tree_selector = triton_tree.wire_result
         self.vocab = target.vocab
         self.head = self.target.load_head(self.device)
-        self.sparse = native_head.NativeSparseHead(draft_pack, prebuilt, device.index)
+        self.sparse = native_head.NativeSparseHead(draft_pack, prebuilt, device.index, shard_rank=sparse_shard)
         if self.sparse.vocab != self.vocab:
             raise ValueError("DSpine candidate head vocabulary differs from target")
         weights = model.w
@@ -189,9 +189,11 @@ class ProposalHead(ProposalInputs):
             model.packed[rank:], weights["selected_prefix_bridge.codebook"], chunk=4096,
         )
 
-    def tokens(self, hidden, stash, ids, width, *, with_tree=False):
+    def tokens(self, hidden, stash, ids, width, *, with_tree=False, candidates=None):
         torch = self.torch
-        candidates = self.sparse.candidates(hidden[1:], self.head, pool_per_shard=80).contiguous()
+        if candidates is None:
+            candidates = self.sparse.candidates(hidden[1:], self.head, pool_per_shard=80)
+        candidates = candidates.contiguous()
         table = self.tail.serial_table(
             stash["raw"], self.norm, candidates, ids, self.head, self.tg, self.tsv,
             stash["packed"], stash["rms"], self.bias, BLOCK, with_log_probabilities=with_tree,

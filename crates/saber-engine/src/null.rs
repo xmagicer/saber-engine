@@ -214,6 +214,7 @@ impl NullForward {
             attention_interval: 4,
             vocab: 248_320,
             weights: 0,
+            rank_memory_plane: String::new(),
             // The same shape of statement the device pass makes, so the banner path is exercised.
             supplied: vec![("null".to_owned(), 1)],
             device_bytes: 0,

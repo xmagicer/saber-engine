@@ -129,8 +129,23 @@ pub struct Decls {
 impl Decls {
     /// Parse the manifests under `prebuilt`.
     pub fn load(prebuilt: &Path) -> anyhow::Result<Decls> {
+        Self::load_for_ar(prebuilt, false)
+    }
+
+    /// The no-P2P object's declaration is needed only by the registered-host profile.
+    pub fn load_for_ar(prebuilt: &Path, host: bool) -> anyhow::Result<Decls> {
+        Self::load_plugins(
+            prebuilt,
+            PLUGINS.into_iter().chain(host.then_some("flashnext_ar_host")),
+        )
+    }
+
+    pub(super) fn load_plugins(
+        prebuilt: &Path,
+        plugins: impl IntoIterator<Item = &'static str>,
+    ) -> anyhow::Result<Decls> {
         let mut by_sym = BTreeMap::new();
-        for p in PLUGINS {
+        for p in plugins {
             let m = Manifest::load(prebuilt.join(format!("{p}.manifest.toml")))
                 .with_context(|| format!("{p}.manifest.toml"))?;
             for k in m.kernel {

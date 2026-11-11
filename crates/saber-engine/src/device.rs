@@ -838,6 +838,8 @@ pub struct EngineConfig {
     /// the control); `ExpLen` = the host's expected-length chain over the same lattice (an ARM),
     /// read back in the proposal's own pinned batch. BOTH ranks: the two compare one block digest.
     pub selector_rank: crate::selector_rank::SelectorRank,
+    /// Score all rows of the resident FP8 head for single-request B8 proposals.
+    pub draft_full_vocab: bool,
     /// **P27-15c: the verify's row form** (`--engine-spec-tree`; [`crate::spec_tree::SpecTreeForm`]):
     /// `Off` = today's chain of 7 (the default and the control); `Ancestor9` = the best-first
     /// 9-node ancestor-mask tree (an ARM; numerics). The boot resolves it through
@@ -1128,6 +1130,7 @@ type MixedReply = (
 
 mod canary;
 mod fused;
+mod memory;
 mod shadow;
 
 fn engine_graph(cfg: &EngineConfig, width: u32) -> Result<Graph, saber_model::ModelError> {
@@ -4451,6 +4454,30 @@ fn run(
 ) -> Result<(), ForwardError> {
     use crate::startup::Phase as Boot;
     let dspine = cfg.dspine_socket.is_some();
+    if cfg.draft_full_vocab
+        && (dspine || cfg.world != 2 || cfg.draft_block != 8 || cfg.draft_pack.is_none())
+    {
+        return Err(ForwardError::Device(
+            "full-vocabulary drafting requires a resident TP2 B8 drafter".into(),
+        ));
+    }
+    if cfg.selector_rank == crate::selector_rank::SelectorRank::TandemB16Calibrated {
+        if dspine || cfg.world != 2 || cfg.draft_block != 16 || cfg.max_seqs != 1
+            || cfg.decode_batches != [1] || cfg.decode_widths != [1, 10] || cfg.gdn_replay
+            || spec_tree_arm(cfg).runs != crate::spec_tree::SpecTreeForm::Ancestor9 {
+            return Err(ForwardError::Device("tandem-b16-calibrated requires native TP2, B16, ancestor9, max-seqs 1, batches 1, widths 1,10 and GDN replay off".into()));
+        }
+        let draft = cfg.draft_pack.as_ref().ok_or_else(|| ForwardError::Device(
+            "tandem-b16-calibrated requires a resident drafter".into()))?;
+        let tier = |dir: &std::path::Path| {
+            PackReader::open(&pack_file(dir, cfg.rank))
+                .map(|r| r.header().tier_id)
+                .map_err(device_err("opening calibrated target and draft pack headers"))
+        };
+        if !crate::spec_tree::tandem_b16::supports_packs(&tier(&cfg.pack)?, &tier(draft)?) {
+            return Err(ForwardError::Device("tandem-b16-calibrated requires the matching Quark 27B target and Tandem B16 draft pack tier IDs".into()));
+        }
+    }
     if cfg.draft_block == 16
         && cfg.spec_tree == crate::spec_tree::SpecTreeForm::Ancestor9
         && (cfg.max_seqs != 1
@@ -5176,6 +5203,11 @@ fn run(
             ),
             None => cfg.head.rerank().unwrap_or_default(),
         };
+        if cfg.draft_full_vocab && rerank != saber_model::dflash_graph::RerankHead::W8 {
+            return Err(ForwardError::Device(
+                "full-vocabulary drafting requires channel-FP8 rerank weights".into(),
+            ));
+        }
         let tier = crate::draft_tier::DraftTier::plan_with(
             cfg.world,
             cfg.draft_block,
@@ -6160,8 +6192,10 @@ fn run(
     let ring = PinnedRing::new(&mut staging, &reserved).map_err(device_err("the staging ring"))?;
     let mut sink = HipSink::new(hip, &reserved).map_err(device_err("the upload sink"))?;
     let mut weights: BTreeMap<String, BoundWeight> = BTreeMap::new();
+    let mut resident_weight_bytes = 0;
     let stats = upload
         .run(&mut sink, &ring, |r| {
+            resident_weight_bytes += memory::weight_payload(r.name, r.len);
             if let Some(layout) = layout_of.get(r.name) {
                 weights.insert(r.name.to_string(), BoundWeight::new(r.addr, *layout));
             }
@@ -7608,6 +7642,7 @@ fn run(
                 HipSink::new(hip, &reserved).map_err(device_err("the drafter's sink"))?;
             let stats = up
                 .run(&mut sink, &ring, |r| {
+                    resident_weight_bytes += memory::weight_payload(r.name, r.len);
                     addr.insert(r.name.to_string(), r.addr);
                 })
                 .map_err(device_err("uploading the drafter"))?;
@@ -8690,6 +8725,45 @@ fn run(
         }
     }
 
+    // External draft workers own additional GPU memory outside this process.
+    // Publish only complete rank measurements for native boots.
+    let draft_kv = drafter.as_ref().map_or(Some(0), |r| {
+        memory::draft_kv_bytes(&r.named, |i| r.bufs.get(i).map(DevicePtr::len))
+    });
+    let local_memory = draft_kv.filter(|_| !dspine).map(|draft_kv| {
+        let target_kv: u64 = state_bufs
+            .iter()
+            .filter(|b| b.per_slot.is_none())
+            .map(|b| b.ptr.len())
+            .sum();
+        memory::RankMemory {
+            rank: cfg.rank,
+            pci_bdf: hip
+                .device_pci_bus_id(cfg.device)
+                .ok()
+                .filter(|s| !s.is_empty()),
+            resident_weight_bytes: resident_weight_bytes
+                + vision.as_ref().map_or(0, |v| v.weight_payload_bytes),
+            kv_pool_allocated_bytes: target_kv + draft_kv,
+        }
+    });
+    let mut rank_memory = Vec::new();
+    if let Some(peer) = &peer {
+        let frame = serde_json::to_vec(&local_memory).map_err(device_err("encoding rank memory"))?;
+        let received = peer
+            .exchange()
+            .xchg_bytes("engine.rank-memory", &frame)
+            .map_err(|e| ForwardError::Peer(e.to_string()))?;
+        let other: Option<memory::RankMemory> = serde_json::from_slice(&received)
+            .map_err(|e| ForwardError::Peer(format!("decoding rank memory: {e}")))?;
+        if other.as_ref().is_some_and(|m| m.rank != peer.peer_rank()) {
+            return Err(ForwardError::Peer(
+                "rank memory came from the wrong rank".into(),
+            ));
+        }
+        rank_memory.extend(other);
+    }
+    rank_memory.extend(local_memory);
     let device_bytes = budget_at_start.saturating_sub(budget);
 
     phases.record(
@@ -8854,6 +8928,7 @@ fn run(
         attention_interval: graph.config.full_attention_interval,
         vocab,
         weights: inputs.weights.len(),
+        rank_memory_plane: memory::render(&mut rank_memory),
         supplied: supplied.into_iter().collect(),
         device_bytes,
         kv_pool_blocks,
@@ -13800,6 +13875,10 @@ fn build_drafter(
     };
     let mut drules = saber_kernels::dflash::DflashRules::prod_dflash()
         .map_err(device_err("the committed dflash rules"))?;
+    drules.head.full_vocab_b1 = cfg.draft_full_vocab;
+    if cfg.draft_full_vocab {
+        println!("draft head rank {}: full FP8 vocabulary at b1, INT2 preselection above b1", cfg.rank);
+    }
     if cfg.drafter_gateup_m64 > 0 {
         // CMP27K: the drafter gate_up's one-pass 64-row tile, bound for every drafter plan.
         drules.knobs.gateup_m64 = cfg.drafter_gateup_m64;
@@ -15942,8 +16021,9 @@ fn propose_block(
         if res.spec_tree_plans {
             if let Some((sc, ca)) = lattice.as_ref() {
                 let plan = sc.get(r * lat_s..).zip(ca.get(r * lat_c..)).map(|(s, c)| {
-                    crate::spec_tree_step::plans_from_read(
+                    crate::spec_tree_step::plans_from_read_for_selector(
                         res.spec_tree_form,
+                        res.selector_rank,
                         &[0],
                         s,
                         c,
@@ -15952,6 +16032,13 @@ fn propose_block(
                     )
                     .remove(0)
                 });
+                if res.selector_rank == crate::selector_rank::SelectorRank::TandemB16Calibrated {
+                    match plan.as_ref() {
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => return Err(ForwardError::Device(format!("tandem-b16-calibrated tree: {e}"))),
+                        None => return Err(ForwardError::Device("tandem-b16-calibrated tree has no selector frame".into())),
+                    }
+                }
                 if let (Some(t), Some(Ok(p))) = (&res.tree, plan.as_ref()) {
                     t.plans
                         .borrow_mut()

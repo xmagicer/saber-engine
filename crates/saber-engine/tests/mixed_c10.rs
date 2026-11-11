@@ -221,3 +221,77 @@ fn a_packed_chunks_tables_are_one_set_by_suffix() {
         assert!(!keys.contains(&k), "a packed key collides with a plan key");
     }
 }
+
+#[test]
+fn cached_prefixes_survive_chunk_chunk_and_chunk_decode_appends() {
+    use saber_engine::{index_table, SeqFacts, StepIndex};
+    use saber_exec::forward::KV_BLOCK;
+    use saber_exec::mixed::merge_rows;
+    use saber_plan::Phase;
+    use saber_sched::mixed_law::{isolated_at_cursors, RowState};
+
+    // Two chunks and one decoder share both complete prefix pages. Their next
+    // two tokens start at offsets 0, 1, and 2 in three distinct append pages.
+    let tables = [[7, 8, 11], [7, 8, 12], [7, 8, 13]];
+    let seqs: Vec<_> = tables
+        .iter()
+        .enumerate()
+        .map(|(i, pages)| SeqFacts {
+            state_slot: i as u32 + 1,
+            done_before: 2 * KV_BLOCK + i as u32,
+            kv_blocks: pages,
+            live_rows: 2,
+            rope: None,
+        })
+        .collect();
+    isolated_at_cursors(
+        seqs.iter().map(|s| {
+            (
+                RowState {
+                    kv_blocks: s.kv_blocks,
+                    gdn_set: s.state_slot,
+                },
+                s.done_before,
+            )
+        }),
+        KV_BLOCK,
+    )
+    .expect("complete shared pages");
+
+    let append = |idx, phase, rows| {
+        let ids = vec![0; rows as usize];
+        let step = StepIndex {
+            phase,
+            rows,
+            max_blocks: 3,
+            seqs: &seqs[idx..=idx],
+            ids: &ids,
+            committed_before: &[1],
+            band_width: None,
+        };
+        index_table("l3.attn.kv_append.slot", &step).expect("append slots")
+    };
+    let first = append(0, Phase::Prefill, 8);
+    let second = append(1, Phase::Prefill, 2);
+    let decode = append(2, Phase::Decode, 2);
+    let chunks = merge_rows(&first, 8, &second, 2, 2, 8).unwrap();
+    let all = merge_rows(&chunks, 8, &decode, 2, 4, 8).unwrap();
+    let slots: Vec<_> = all
+        .chunks_exact(8)
+        .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    let page = i64::from(KV_BLOCK);
+    assert_eq!(
+        slots,
+        [
+            11 * page,
+            11 * page + 1,
+            12 * page + 1,
+            12 * page + 2,
+            13 * page + 2,
+            13 * page + 3,
+            -1,
+            -1
+        ]
+    );
+}

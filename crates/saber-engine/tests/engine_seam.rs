@@ -309,6 +309,26 @@ async fn a_long_prompt_is_chunked_and_the_client_hears_nothing_until_the_last_ch
     assert_eq!(tokens_of(&events).len(), 4);
 }
 
+#[tokio::test]
+async fn a_refused_nonfinal_prefill_chunk_aborts_without_advancing_the_prompt() {
+    // The scheduler sends a p2048 chunk; this forward only has a p512 bucket.
+    let sched = scheduler(NullForward::new(&[512], BATCHES, 8));
+    let prompt: Vec<TokenId> = (0..PREFILL + 1).collect();
+    let sub = sched.submit(request(&prompt, 4)).expect("admit");
+    assert_eq!(sched.run_steps(10), 1, "do not schedule the next chunk");
+
+    let events = drain(sub).await;
+    assert_eq!(events.len(), 1);
+    assert!(events[0].new_tokens.is_empty());
+    assert_eq!(
+        events[0].finished,
+        Some(saber_serve::engine::FinishReason::Abort)
+    );
+    assert_eq!(sched.counters().prefill_computed_tokens, 0);
+    assert_eq!(sched.counters().executor_protocol_errors, 1);
+    assert_eq!(sched.with_executor(|e| e.counters().forward_errors), 1);
+}
+
 /// The graph and the eager path are the same step twice, and the counters are what tell them apart.
 #[tokio::test]
 async fn the_graph_and_eager_paths_give_the_same_ids() {

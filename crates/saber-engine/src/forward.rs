@@ -692,6 +692,8 @@ pub struct ForwardFacts {
     pub vocab: u32,
     /// Weight records bound by name out of the pack.
     pub weights: usize,
+    /// Rank-labelled native device memory gauges captured at boot. Empty when unavailable.
+    pub rank_memory_plane: String,
     /// Ops with no code object on this branch, by op id and count. Non-empty means the tokens are
     /// **not** the model's tokens, and every report has to say so.
     pub supplied: Vec<(String, u32)>,

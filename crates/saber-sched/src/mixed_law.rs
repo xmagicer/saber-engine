@@ -367,6 +367,57 @@ pub struct RowState<'a> {
     pub gdn_set: u32,
 }
 
+/// Check the page tables and resident token counts of every live sequence in a fused step.
+/// KV appends start at the resident count. Only whole pages before that cursor can be
+/// shared, at the same logical position in every table. GDN sets always have one owner.
+///
+/// # Errors
+/// Invalid page geometry, a shared writable page, a misplaced page or a shared GDN set.
+pub fn isolated_at_cursors<'a>(
+    rows: impl IntoIterator<Item = (RowState<'a>, u32)>,
+    block_tokens: u32,
+) -> Result<(), String> {
+    use std::collections::{hash_map::Entry, HashMap, HashSet};
+
+    let mut pages = HashMap::new();
+    let mut sets = HashSet::new();
+    for (row, done_before) in rows {
+        let complete = done_before
+            .checked_div(block_tokens)
+            .ok_or("zero tokens per KV block")? as usize;
+        if complete > row.kv_blocks.len() {
+            return Err(format!(
+                "GDN set {} has fewer KV blocks than its resident prefix",
+                row.gdn_set
+            ));
+        }
+        if !sets.insert(row.gdn_set) {
+            return Err(format!(
+                "GDN set {} belongs to multiple live sequences",
+                row.gdn_set
+            ));
+        }
+        for (index, &block) in row.kv_blocks.iter().enumerate() {
+            let readonly = index < complete;
+            match pages.entry(block) {
+                Entry::Vacant(entry) => {
+                    entry.insert((row.gdn_set, index, readonly));
+                }
+                Entry::Occupied(entry) => {
+                    let (owner, previous_index, previous_readonly) = *entry.get();
+                    if !readonly || !previous_readonly || index != previous_index {
+                        return Err(format!(
+                            "KV block {block} at logical pages {previous_index}/{index} of GDN sets {owner}/{} is not a shared complete prefix page",
+                            row.gdn_set
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// P12/P13's contamination law for a fused step: the chunk's sequence and every decode sequence
 /// own disjoint KV pages and distinct GDN slot sets. `Err` names the first shared page or slot.
 ///
@@ -660,5 +711,40 @@ mod tests {
         };
         let e = isolated_packed(&[a, twin], &[d]).expect_err("set");
         assert!(e.contains("GDN set 3"), "{e}");
+    }
+
+    #[test]
+    fn cached_pages_must_be_complete_for_every_holder() {
+        let row = |blocks, gdn_set| RowState {
+            kv_blocks: blocks,
+            gdn_set,
+        };
+        let a = row(&[10, 20, 21], 1);
+        let b = row(&[10, 30, 31], 2);
+        let c = row(&[10, 40, 41], 3);
+        assert!(isolated_at_cursors([(a.clone(), 16), (b.clone(), 17), (c, 32)], 16).is_ok());
+        // An append to the partially occupied page must still fail in either ordering.
+        for rows in [
+            [(a.clone(), 15), (b.clone(), 16)],
+            [(b.clone(), 16), (a.clone(), 15)],
+        ] {
+            assert!(isolated_at_cursors(rows, 16)
+                .unwrap_err()
+                .contains("KV block 10"));
+        }
+        // Sharing a future page, a page at a different logical position, or mutable
+        // recurrent state remains invalid even when the two also share a valid prefix.
+        let future = row(&[10, 35, 21], 4);
+        let shifted = row(&[50, 10, 51], 5);
+        let same_set = row(&[10, 60], 1);
+        for (other, done, what) in [
+            (future, 16, "KV block 21"),
+            (shifted, 32, "KV block 10"),
+            (same_set, 16, "GDN set 1"),
+        ] {
+            assert!(isolated_at_cursors([(a.clone(), 16), (other, done)], 16)
+                .unwrap_err()
+                .contains(what));
+        }
     }
 }

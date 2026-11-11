@@ -1,4 +1,4 @@
-"""Import a BF16 Qwen3.8-27B-DFlash2 block-8 or block-16 checkpoint into a TP=2 SBR pack.
+"""Import a BF16 Qwen3.8-27B-DFlash2 checkpoint trained at block 8, 16 or 32 into a TP=2 SBR pack.
 
 The supported template is the shipped block-8 DFlash2 W8 rerank pack. Its
 record layout, static RoPE table and target-derived head are reusable. Every
@@ -80,7 +80,7 @@ def check_config(config, control):
     if any(config.get(k) != v for k,v in expected.items()):
         raise ValueError('Checkpoint geometry differs from the native DFlash2 profile')
     block = config.get('dflash_config', {}).get('block_size')
-    if block not in ((8,) if control else (8, 16)):
+    if block not in ((8,) if control else (8, 16, 32)):
         raise ValueError('Unsupported DFlash2 training block size')
     wanted={'block_size':block,'conv_group_size':16,'conv_kernel_size':2,
             'mask_token_id':248070,'selector_rank':256,'selector_top_k':16,

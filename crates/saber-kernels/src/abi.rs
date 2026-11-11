@@ -3522,6 +3522,8 @@ pub fn signature_for(kernel: &str) -> Option<&'static [SigArg]> {
         SIG_FN_PICK_TOP64
     } else if kernel == "fn_xmiss_e256" {
         SIG_FN_XMISS
+    } else if kernel == "fn_ar_host_exact_bf16" {
+        SIG_SABER_AR_EXACT
     } else if kernel.starts_with("fn_ar_ll_exact_bf16") {
         SIG_FN_AR_LL
     } else if kernel == "fn_gate98" {

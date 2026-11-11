@@ -126,12 +126,32 @@ tools, streaming, thinking and multi-turn tests passed. Cancellation drained in
 and reload took 14.55 s; the original 7200-second policy was restored. Observed
 container shutdowns exited successfully. No kernel or boot configuration changed.
 
-`--engine-spec-tree best16` exposes the existing 16-row ancestor verifier. It
-currently requires `--engine-max-seqs 1`; the 16-row chain-after-tree flush is
-not implemented. Its state advance uses the matching 16-row record layout and
-must not run through the 10-row batched advance kernel. It passed checked model
-trials, but its extra verification cost offset most acceptance gains. It is not
-the default. The ordinary 16-query attention guard remains unchanged.
+`--engine-spec-tree best16` enables the 16-row ancestor verifier for one active
+sequence. Its state advance uses the 16-row record layout. The target can also
+plan a six-wave uniform causal kernel at exactly 16 queries for GQA 6, head size
+256 and a 16-token page. Chain and tree captures have separate identities on
+both TP ranks. Worker wire version 18 exchanges each rank's memory measurements at boot and requires matching binaries.
 
-DSpine utilities are documented [separately](../tools/dspine/README.md). They
-are acceptance and numerical experiments, not a DSpine serving backend.
+The native server publishes `saber:resident_weight_bytes` and
+`saber:kv_pool_allocated_bytes` on `/metrics`. Each rank reports its own weight
+tensor payloads and total target and draft K/V allocations. Shared weights
+count once per physical upload. The weight gauge excludes RoPE tables and
+padding. The K/V gauge includes free and reserved pages without GDN state or
+graph scratch. The optional `pci_bdf` label identifies the device selected by
+HIP on that rank.
+
+The experimental DSpine socket backend consumes verified target features and
+returns chain or 15-node proposals. In the tested matched-Quark configuration
+the optimized tree measured 203.91 tok/s for code and 137.57 tok/s for prose.
+At the time of the DSpine experiment the managed service ran the NVFP4 + DFlash2 hybrid. The current eight-slot profile uses the matched Quark target and Tandem B8 with a full FP8 draft head for single-request proposals. [Managed profile and measurements](HOST-COLLECTIVES.zh-CN.md).
+[See the DSpine launch procedure and feature limits](../tools/dspine/README.md).
+
+## Tandem B16 candidate calibration
+
+With the matched Quark Qwen3.8-27B core and a resident Tandem B16 drafter,
+`--engine-selector-rank tandem-b16-calibrated` scores all 16 conditional
+candidates before selecting three children per parent for the nine-node tree.
+Use TP=2, one sequence, decode batches `1`, widths `1,10`, draft block 16,
+`--engine-spec-tree ancestor9` and `--engine-gdn-replay off`.
+Both ranks check the packed target and draft identities on startup.
+The default selector is `walk`. The target verifies every proposed path.

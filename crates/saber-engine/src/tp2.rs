@@ -131,7 +131,7 @@ const MAGIC: u32 = 0x5342_5432;
 /// ([`saber_exec::RankPeer::agree`], through [`crate::device`]'s startup handshake): a pair of
 /// mismatched binaries is then a message while both cards are still idle, rather than a refused
 /// frame with a graph already in flight on each of them.
-pub const VERSION: u32 = 17;
+pub const VERSION: u32 = 18;
 
 /// **C10: a packed step's word** ([`Command::Mixed::packed`]): `more` further chunks, and per
 /// chunk `k` (bit `k`) whether its head samples, its seam runs, and its seam carries penalties.
@@ -2799,7 +2799,7 @@ mod tests {
             Command::decode(&old, 7).is_err(),
             "a rank without a tree/chain discriminator must refuse this frame"
         );
-        assert_eq!(VERSION, 17);
+        assert_eq!(VERSION, 18);
     }
 
     /// C10: a packed step's word round-trips K, the per-chunk sample / seam / penalty masks, and

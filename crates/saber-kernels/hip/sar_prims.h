@@ -113,7 +113,12 @@ __device__ __forceinline__ u64 signal_wait(u32* peer_flag, const u32* my_flag, u
   flag_release(peer_flag, s);
   u64 z = 0;
   while (flag_acquire(my_flag) < s) {
-    if (++z > SABER_AR_SPIN_MAX) break;
+    if (++z > SABER_AR_SPIN_MAX) {
+#ifdef SABER_AR_TRAP_TIMEOUT
+      __builtin_trap();
+#endif
+      break;
+    }
   }
   return z;
 }

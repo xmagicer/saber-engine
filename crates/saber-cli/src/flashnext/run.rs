@@ -660,6 +660,16 @@ pub struct FnFlags {
     /// until FN14, which gave the word to the decode graphs.)
     #[arg(long)]
     pub fn_dump: bool,
+    /// Offline TP=2 workers: save the full next-token logits after each prompt as
+    /// little-endian FP32 (`<prompt-id>.f32`) for comparison with a reference model.
+    #[arg(long)]
+    pub fn_prefill_logits_dir: Option<PathBuf>,
+    /// Offline single-request DFlash2 draft service for Flash-Next. The target verifies every token.
+    #[arg(long)]
+    pub fn_dflash2_socket: Option<PathBuf>,
+    /// Number of DFlash2 candidates per target verify (1..4, default 4).
+    #[arg(long, requires = "fn_dflash2_socket", value_parser = clap::value_parser!(u32).range(1..=4))]
+    pub fn_dflash2_k: Option<u32>,
     /// Flash-Next (FN14): the pairing CONTROL -- run every decode step EAGERLY (FN13's form). The
     /// default replays one hipGraph per (decode bucket 1/2/4/8, PLE parity), captured on first use.
     #[arg(long)]
@@ -1311,7 +1321,10 @@ pub struct FnFlags {
     /// whatever the grid -- instead of each block's own counter, which aliases a slot the peer is
     /// still reading when the grid changes between back-to-back calls; LEDGER FN114b / FN114d):
     /// THE DEFAULT since FN114d.
-    #[arg(long, default_value = DEFAULT_FN_AR, value_parser = ["oneshot", "ll", "gp"])]
+    /// `host` selects an exact system-scope reduce over registered host pages on two
+    /// workers without GPU peer access. SPEC=0 is the default; an explicit fixed MTP
+    /// depth uses the host draft chain without peer producer fusions or issue-ahead.
+    #[arg(long, default_value = DEFAULT_FN_AR, value_parser = ["oneshot", "ll", "gp", "host"])]
     pub fn_ar: String,
     /// Flash-Next (FN137 Phase B): the TP = 2 MoE-out all-reduce of a fused decode / verify back
     /// half (`--fn-experts tp2`) -- `off` (its own launch after the back half: THE DEFAULT and the
@@ -3126,6 +3139,20 @@ impl FnFlags {
     pub fn resolved(&self) -> FnFlags {
         let mut f = self.clone();
         f.fn_mtp = self.fn_mtp_arg.unwrap_or_else(|| self.default_mtp());
+        if f.fn_ar == "host" {
+            f.fn_ar_exact = true;
+            f.fn_ar_prologue = "off".into();
+            f.fn_moe_ar_push = "off".into();
+            f.fn_mixer_ar_push = "off".into();
+            f.no_fn_hc_rr_producer = true;
+            f.fn_device_step = Some("off".into());
+            f.fn_first_step = "pass".into();
+            f.fn_hand = Some("none".into());
+            f.spec_couple = Some("off".into());
+            f.no_fn_mtp_device_chain = true;
+            f.fn_mtp = self.fn_mtp_arg.unwrap_or(FnMtp::Off);
+            f.fn_mtp_arg = Some(f.fn_mtp);
+        }
         f
     }
 
@@ -3289,6 +3316,8 @@ impl FnFlags {
             && self.fn_prompts.is_empty()
             && self.fn_long.is_empty()
             && !self.fn_dump
+            && self.fn_prefill_logits_dir.is_none()
+            && self.fn_dflash2_socket.is_none()
             && !self.no_fn_capture
             && !self.fn_capture_verify
             && self.fn_poison_step.is_none()
@@ -3624,7 +3653,32 @@ pub fn main(
     f: &FnFlags,
 ) -> anyhow::Result<()> {
     // FN16f: `--fn-mtp` absent -> auto under `--fn-serve`, SPEC 0 in the harness
+    if f.fn_ar == "host" {
+        ensure!(tp == 2 && !f.fn_one_process, "--fn-ar host requires two worker processes and --tp 2");
+        ensure!(
+            !matches!(f.fn_mtp_arg, Some(FnMtp::Auto))
+                && f.fn_mtp_ref.is_none()
+                && !f.fn_mtp_shadow
+                && !f.fn_mtp_dynamic
+                && !f.fn_mtp_chain_selftest
+                && !f.fn_mtp_chain_check
+                && !f.fn_mtp_chain_graph
+                && f.fn_mtp_conf_log.is_none(),
+            "--fn-ar host supports SPEC=0 or a fixed host draft chain (--fn-mtp 1..4), without device-chain diagnostics"
+        );
+        println!("fnar host: registered host pages, exact BF16; MTP {:?}, host pick exchange and draft chain, device-step and peer producer fusions off", f.fn_mtp_arg.unwrap_or(FnMtp::Off));
+    }
     let f = &f.resolved();
+    if f.fn_dflash2_socket.is_some() {
+        ensure!(
+            tp == 2 && f.fn_ar == "host" && !f.fn_one_process && !f.scripted()
+                && f.fn_serve.is_none() && f.fn_conc == [1] && f.fn_sched == "groups"
+                && f.fn_turns == 1 && f.fn_decode > 1 && !f.fn_preflight
+                && (f.no_fn_capture || (f.graph_split()? == GraphSplit::Layer && !f.fn_capture_verify))
+                && f.fn_mtp == FnMtp::Off && f.fn_mtp_ref.is_none() && !f.fn_mtp_no_rollback,
+            "--fn-dflash2-socket requires the offline single-turn greedy harness: --tp 2 --fn-ar host --fn-mtp 0 --fn-conc 1 --fn-decode N (N >= 2) and --no-fn-capture or --fn-graph-split layer"
+        );
+    }
     let ckpt = manifest_ckpt(pack)?;
     let cfg = Qwen4ExpConfig::from_config_json(&std::fs::read_to_string(ckpt.join("config.json"))?)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -3661,6 +3715,13 @@ pub fn main(
         }
     };
     let out = f.fn_out.clone().context("--fn-out DIR")?;
+    if let Some(dir) = &f.fn_prefill_logits_dir {
+        ensure!(
+            f.fn_serve.is_none() && !f.fn_one_process && f.fn_conc == [1] && f.fn_repeat == 1 && f.fn_decode == 0,
+            "--fn-prefill-logits-dir requires offline TP=2 workers, --fn-conc 1, --fn-repeat 1 and --fn-decode 0"
+        );
+        std::fs::create_dir_all(dir)?;
+    }
     std::fs::create_dir_all(&out)?;
     // FN54: the host keep-awake arm lives in rank 0's process for the whole boot
     let _keepalive = if f.fn_control.as_deref() == Some("host-keepalive") && f.fn_rank == 0 {
@@ -5682,7 +5743,7 @@ pub fn plan_boot_at(
         Some(g) => g,
         None => super::xtp2::XGeom::of(f, pack)?,
     };
-    let decls = Decls::load(prebuilt)?;
+    let decls = Decls::load_for_ar(prebuilt, f.fn_ar == "host")?;
     let rules = boot_rules(f)?;
     let pctx = pools_ctx(f, prompts);
     ensure!(
@@ -5851,6 +5912,12 @@ pub fn plan_boot_at(
             });
             c
         };
+        if f.fn_dflash2_socket.is_some() {
+            classes.push(saber_mem::flashnext_budget::Class {
+                name: "fn.dflash2.taps".into(),
+                bytes: super::worker::dflash2_tap_bytes(f, prompts),
+            });
+        }
         // FN55b: the tower (its weight window + its arena) is billed BEFORE the expert slots are
         // sized (the slots are the remainder); a text-only boot's ledger is unchanged
         // FN55c: under `lazy` the class is the REGION the tower will be uploaded into (the
@@ -6173,6 +6240,12 @@ pub fn plan_boot_at(
     // pinned bytes outside the classes are the warm/verify stage (64 slots), the xptr mirrors and
     // the tier's table mirror -- declared at FN_PLANE_PINNED
     host.serve_pinned = FN_PLANE_PINNED;
+    if f.fn_ar == "host" {
+        // Both workers map both mailboxes; each physical file is pinned only once.
+        let region = 2 * super::host_ar::slot_bytes(f.max_chunk()) + 4 * super::host_ar::BLOCKS;
+        let per_rank = region.div_ceil(4096) * 4096;
+        host.serve_pinned += 2 * per_rank;
+    }
     // FN51e: the PLE row cache counts at its flag's bytes (was 1 GiB a rank whatever the flag)
     host.ple_cache_per_rank = f.xtier.ple_cache_mib << 20;
     // FN99: the embedding half a rank in pinned RAM (0 at `vram`)
@@ -6491,6 +6564,7 @@ fn engine_tp2(
     let st0 = devs[0].ar_alloc(&arules, mb)?;
     let st1 = devs[1].ar_alloc(&arules, mb)?;
     let mut pair = ArPair {
+        host: false,
         rules: arules,
         st: [st0, st1],
         mb,
@@ -8619,6 +8693,23 @@ mod tests {
             d.site(v).unwrap();
         }
         assert!(d.site(vec![3; DF120_SITE_BYTES as usize]).is_err());
+    }
+
+    #[test]
+    fn host_ar_excludes_peer_writing_paths_but_preserves_the_default() {
+        let original = fnx(&[]).resolved();
+        assert_eq!(original.fn_ar, DEFAULT_FN_AR);
+        let host = fnx(&["--fn-serve", "8099", "--fn-ar", "host"]).resolved();
+        assert!(host.fn_ar_exact);
+        assert!(!host.fn_mtp.on() && !host.spec_couple().unwrap());
+        assert_eq!(host.device_step().unwrap(), super::super::dstep::DeviceStep::Off);
+        assert!(!host.hc_rr_producer() && !ar_prologue(&host) && !moe_ar_push(&host));
+        assert_eq!(mixer_ar_push(&host), super::super::dev::MixPush::Off);
+        assert!(!first_step_dev(&host));
+        let mtp = fnx(&["--fn-serve", "8099", "--fn-ar", "host", "--fn-mtp", "2"]).resolved();
+        assert_eq!(mtp.fn_mtp, FnMtp::K(2));
+        assert!(mtp.no_fn_mtp_device_chain);
+        assert!(!mtp.spec_couple().unwrap() && !draft_int2_on(&mtp));
     }
 
     fn fnx(args: &[&str]) -> FnFlags {

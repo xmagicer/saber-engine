@@ -74,6 +74,9 @@ pub struct Knobs {
 /// The draft head's geometry (`[head]`), every number read off prod's own module and traced launch.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HeadKnobs {
+    /// Engine-selected full W8 scoring on a one-request proposal.
+    #[serde(skip)]
+    pub full_vocab_b1: bool,
     /// `BLOCK_M`: the tile height, and the row count of every buffer the head writes.
     pub bm: u32,
     /// `BLOCK_N`: columns per workgroup, and the width of one block-max entry. The grid is `n/bn`.

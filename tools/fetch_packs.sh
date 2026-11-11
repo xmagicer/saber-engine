@@ -31,8 +31,7 @@ HF=$(command -v hf || command -v huggingface-cli || true)
 want=${1:-}
 case "$want" in 27b | 27b-tp1 | 27b-quark | 27b-quark-tp1 | flashnext | all) ;; *) echo "usage: $0 27b|27b-tp1|27b-quark|27b-quark-tp1|flashnext|all" >&2; exit 2 ;; esac
 
-# A pack the engine would refuse fails here, by name, instead of mid-boot: every rank file
-# must start with the SBRPACK1 magic (docs/abi/PACK.md).
+# The 27B rank files use the SBRPACK1 container (docs/abi/PACK.md).
 check_packs() {
   local f bad=0
   for f in "$@"; do
@@ -115,6 +114,9 @@ if [ "$want" = flashnext ] || [ "$want" = all ]; then
   check_packs "$P"/rank{0,1}/dense.pack "$P"/shared/dense.pack "$P"/vision/rank{0,1}.pack
   [ -s "$P/rank0/experts.tp2.xtier" ] && [ -s "$P/rank1/experts.tp2.xtier" ] \
     || { echo "missing rank*/experts.tp2.xtier under $P" >&2; exit 1; }
+  # Mixed formats: the trunk, MTP and HC files are raw indexed payloads. The
+  # TP experts and vision use different container headers.
+  python3 "$REPO/tools/verify_flashnext_packs.py" "$P"
   # The Flash-Next pack is NOT self-contained: its manifest points into the original checkpoint
   # (embeddings, norms, router, and the 102 GB PLE table are read from its shards in place), at the
   # absolute path the manifest names. Download the checkpoint exactly there.
@@ -122,7 +124,6 @@ if [ "$want" = flashnext ] || [ "$want" = all ]; then
   echo "== $CKREPO -> $CK (~170 GB; resumable)"
   mkdir -p "$CK"
   "$HF" download "$CKREPO" --local-dir "$CK"
-  [ -f "$CK/model-00131-of-00131.safetensors" ] && [ -f "$CK/config.json" ] \
-    || { echo "checkpoint incomplete under $CK" >&2; exit 1; }
+  python3 "$REPO/tools/verify_flashnext_packs.py" "$P" --checkpoint "$CK"
   echo "Flash-Next ready: tools/serve_flashnext.sh"
 fi

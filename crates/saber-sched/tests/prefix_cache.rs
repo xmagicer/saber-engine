@@ -240,6 +240,10 @@ async fn an_adopted_prefix_answers_exactly_what_a_fresh_prefill_answers() {
         let (c, entries, _) = cached.prefix_counters();
         let a = ((len - 1) / BT * BT) as u64;
         assert_eq!((c.hits, c.adopted, c.hit_tokens), (1, 1, a), "{len}: {c:?}");
+        let uncached = (len * 2 + 24 + extra.len()) as u64;
+        assert_eq!(off.counters().prefill_computed_tokens, uncached);
+        assert_eq!(cached.counters().prefill_computed_tokens, uncached - a);
+        assert_eq!(cached.counters().output_committed_tokens, got.len() as u64);
         assert_eq!(
             entries, 2,
             "turn 1's and turn 2's prefixes are both retained"

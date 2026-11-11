@@ -51,6 +51,9 @@ use super::store::{embed_rows, Ckpt, PackRecs};
 mod pcache;
 #[path = "verify.rs"]
 pub mod verify;
+#[path = "dflash2.rs"]
+mod dflash2;
+pub(super) use dflash2::tap_bytes as dflash2_tap_bytes;
 #[cfg(test)]
 pub(super) use pcache::chunk_blocks as pcache_blocks;
 pub(super) use pcache::staging_bound as pcache_staging_bound;
@@ -629,6 +632,8 @@ impl Live {
 /// Per-step timing + counters.
 #[derive(Debug, Clone, Default)]
 pub(super) struct StepStat {
+    /// Offline harness: instant the target's greedy walk made this round's tokens available.
+    committed_at: Option<Instant>,
     host_ms: f64,
     dev_ms: f64,
     launches: u64,
@@ -695,6 +700,7 @@ impl Drop for Child {
 /// Everything one rank owns (the boot's product).
 pub(super) struct Rank<'h, 'x> {
     rank: u32,
+    dflash2: Option<dflash2::Dflash2>,
     hip: &'h HipThread,
     dev: RankDev<'h>,
     table: saber_exec::loader::FunctionTable<'h>,
@@ -1621,7 +1627,12 @@ fn run_rank(
         );
     }
     let lc = LoadCounters::new();
-    let ps = PluginSet::load_named(hip, prebuilt, &PLUGINS, &lc)?;
+    let host_ar = f.fn_ar == "host";
+    let plugins: Vec<_> = PLUGINS
+        .into_iter()
+        .chain(host_ar.then_some("flashnext_ar_host"))
+        .collect();
+    let ps = PluginSet::load_named(hip, prebuilt, &plugins, &lc)?;
     let table = ps.functions(hip)?;
     // FN51: the table covers the pools' context (byte-identical rows below 65,536)
     let cs = rope_table(super::run::rope_pos(super::run::pools_ctx(f, prompts)));
@@ -1686,25 +1697,30 @@ fn run_rank(
     } else {
         ArRules::prod()?
     };
-    let ar_mb = super::dev::ar_mb(f.max_chunk());
-    let mine = dev.ar_alloc(&arules, ar_mb)?;
-    // the reduce's peer-visible regions cross as IPC handles (the 27B's form)
-    let (hs, hf) = {
-        let a = dev.ar.as_ref().context("ar")?;
-        (hip.ipc_export(&a.0)?, hip.ipc_export(&a.1)?)
+    let ar_mb = if host_ar {
+        super::host_ar::slot_bytes(f.max_chunk())
+    } else {
+        super::dev::ar_mb(f.max_chunk())
     };
-    let ps_ = hip.ipc_import(peer.swap_handle("fn.ar.scratch", hs)?)?;
-    let pf_ = hip.ipc_import(peer.swap_handle("fn.ar.flags", hf)?)?;
-    let theirs = ArState {
-        scratch: ps_.as_u64(),
-        flags: pf_.as_u64(),
-        seq: 0,
-        loc: 0,
+    let host_regions;
+    let (mine, theirs) = if host_ar {
+        host_regions = super::host_ar::HostAr::open(hip, &dev.stream, &peer, ar_mb)?;
+        println!("fnar host rank{rank}: {ar_mb} bytes per parity slot, {} blocks, system-scope registered host transport", super::host_ar::BLOCKS);
+        host_regions.states()
+    } else {
+        let mine = dev.ar_alloc(&arules, ar_mb)?;
+        let a = dev.ar.as_ref().context("ar")?;
+        let hs = hip.ipc_export(&a.0)?;
+        let hf = hip.ipc_export(&a.1)?;
+        let ps = hip.ipc_import(peer.swap_handle("fn.ar.scratch", hs)?)?;
+        let pf = hip.ipc_import(peer.swap_handle("fn.ar.flags", hf)?)?;
+        (mine, ArState { scratch: ps.as_u64(), flags: pf.as_u64(), seq: 0, loc: 0 })
     };
     let mut st = [ArState::default(); 2];
     st[ri] = mine;
     st[1 - ri] = theirs;
     let pair = ArPair {
+        host: host_ar,
         rules: arules,
         st,
         mb: ar_mb,
@@ -3057,6 +3073,11 @@ fn run_rank(
     }
     let mut rk = Rank {
         rank,
+        dflash2: if let Some(path) = &f.fn_dflash2_socket {
+            Some(dflash2::Dflash2::new(hip, rank, path, dflash2_tap_bytes(f, prompts))?)
+        } else {
+            None
+        },
         hip,
         dev,
         table,
@@ -3327,6 +3348,10 @@ fn run_rank(
                 for (s, p) in group.iter().enumerate() {
                     let t0 = Instant::now();
                     rk.pools.zero(rk.hip, &rk.dev, s as u32)?;
+                    if let Some(d) = &mut rk.dflash2 {
+                        d.reset()?;
+                        dflash2::sync_context(&rk.peer, "fn.dflash2.reset", 0)?;
+                    }
                     let mut lv = Live::fresh(s as u32, cfg.eos_token_id);
                     let mut cap = f.fn_dump.then(|| Cap::for_prompt(p.ids.len()));
                     let tap = (f.fn_tap_layer >= 0).then(|| taps_dir.join(&p.id));
@@ -3344,6 +3369,15 @@ fn run_rank(
                         Some(&ref_req(Some(p), 0)),
                     )?;
                     lv.next = pick.0[0];
+                    if let Some(dir) = &f.fn_prefill_logits_dir {
+                        let address = rk.last_lg;
+                        let (_, _, logits) = self::pick(&mut rk, address, 1, true)?;
+                        if rank == 0 {
+                            ensure!(logits.len() == VOCAB as usize, "incomplete next-token logit row");
+                            let bytes: Vec<u8> = logits.iter().flat_map(|x| x.to_le_bytes()).collect();
+                            std::fs::write(dir.join(format!("{}.f32", p.id)), bytes)?;
+                        }
+                    }
                     firsts.push(pick.0[0]);
                     // FN80b-2: the mirrored placement after every prompt (a divergence = FATAL)
                     if f.experts_tp2() {
@@ -3394,6 +3428,7 @@ fn run_rank(
                 }
                 if f.fn_decode > 0 {
                     let grp: Vec<&Prompt> = group.iter().collect();
+                    let decode_start = Instant::now();
                     let d = decode(
                         &mut rk,
                         &mut em,
@@ -3407,8 +3442,28 @@ fn run_rank(
                         &mut dp,
                         &grp,
                     )?;
+                    let decode_wall_ms = decode_start.elapsed().as_secs_f64() * 1e3;
                     for (i, r) in reqs.iter_mut().enumerate() {
                         r["gen"] = json!(d.ids[i]);
+                        r["decode_group_wall_ms"] = json!(decode_wall_ms);
+                        let mut remaining = d.ids[i].len();
+                        let mut commits = Vec::new();
+                        for (step, s) in d.steps.iter().enumerate() {
+                            if remaining == 0 { break; }
+                            let count = d.acc.get(step).map_or(1, |a| a[i] as usize + 1).min(remaining);
+                            let at = s.committed_at.context("offline target commit timestamp")?;
+                            commits.push(json!({"elapsed_ns": at.duration_since(decode_start).as_nanos() as u64, "tokens": count}));
+                            remaining -= count;
+                        }
+                        ensure!(remaining == 0, "offline target commit timeline incomplete");
+                        r["decode_commits"] = json!(commits);
+                        if rk.dflash2.is_some() {
+                            r["dflash2"] = json!({
+                                "draft_ids": d.mtp[i],
+                                "accepted": d.acc.iter().map(|a| a[i]).collect::<Vec<_>>(),
+                                "verify_widths": d.widths
+                            });
+                        }
                         r["gen_top"] = json!(d.tops[i]);
                         let mut pr = vec![probe0[i].clone()];
                         pr.extend(d.probes[i].iter().cloned());
@@ -6474,6 +6529,9 @@ fn layer(
     );
     rk.dev.exec(&rk.table, em)?;
     em.pregate = None;
+    if let Some(d) = &mut rk.dflash2 {
+        d.capture(rk.rank, &mut rk.dev, &rk.table, em, l, &outs[0].pend, m)?;
+    }
     if complete && ringed {
         ring_after_layer(rk, l)?;
     }
@@ -7299,6 +7357,10 @@ fn prefill_with(
                 }
             }
             input = LayerIn::Pending(o.pend);
+        }
+        if let Some(d) = &mut rk.dflash2 {
+            d.append(&rk.dev, lv.len + a, m, m)?;
+            dflash2::sync_context(&rk.peer, "fn.dflash2.append", lv.len + b)?;
         }
         let LayerIn::Pending(pend) = input else {
             unreachable!()
@@ -8497,6 +8559,8 @@ fn pick_threads(rows: usize) -> usize {
 
 /// One captured decode step: the graph of a (bucket, PLE parity) and what the capture issued.
 struct StepGraph {
+    // A positive row count certifies all five DFlash2 tap writes in this graph.
+    dflash2_rows: u32,
     /// The segments in launch order: one per decoder layer + the final mixer / head
     /// (`--fn-graph-split layer`, the default), or the whole step (`step`).
     segs: Vec<(saber_hip::GraphExec, saber_hip::Graph)>,
@@ -9734,7 +9798,13 @@ pub(super) fn pools_geometry(f: &FnFlags, prompts: &[Prompt]) -> anyhow::Result<
         max_ctx <= ROPE_POS_MAX,
         "the pools' context {max_ctx} past the checkpoint's {ROPE_POS_MAX} positions"
     );
-    let pool_w = if mtp_verify(f) { f.mtp_k() + 1 } else { 1 };
+    let pool_w = if f.fn_dflash2_socket.is_some() {
+        f.fn_dflash2_k.unwrap_or(4) + 1
+    } else if mtp_verify(f) {
+        f.mtp_k() + 1
+    } else {
+        1
+    };
     Ok((max_ctx, pool_w))
 }
 
@@ -13382,6 +13452,10 @@ pub(super) fn decode_step_with(
             gr.map.insert(
                 key,
                 StepGraph {
+                    dflash2_rows: match rk.dflash2.as_mut() {
+                        Some(d) => d.record_graph(cc.m)?,
+                        None => 0,
+                    },
                     segs,
                     digest: rk.dev.digest,
                     nodes,
@@ -13543,6 +13617,10 @@ pub(super) fn decode_step_with(
                 &gr.map[&key].segs[si].0
             };
             rk.hip.graph_launch(exec, &rk.dev.stream)?;
+        }
+        if let Some(d) = &mut rk.dflash2 {
+            let graph = gr.map.get(&key).context("DFlash2 requires a recorded layer graph")?;
+            d.replayed_graph(graph.dflash2_rows, cc.m)?;
         }
         rk.hip.record_event(&ev.1, &rk.dev.stream)?;
         ensure!(
@@ -13745,6 +13823,9 @@ fn decode(
     if rk.mtp.is_some() && mtp_verify(f) {
         return verify::decode_mtp(rk, em, ple, ph, recs, lives, n, f, gr, dp, group);
     }
+    if rk.dflash2.is_some() {
+        return dflash2::decode(rk, em, ple, ph, recs, lives, n, f, gr, dp, group);
+    }
     let mut res = Decoded {
         acc: Vec::new(),
         widths: Vec::new(),
@@ -13779,7 +13860,7 @@ fn decode(
         let reqs: Vec<RowReq> = (0..b)
             .map(|i| ref_req(group.get(i).copied(), t as usize))
             .collect();
-        let (outs, stat) = decode_step(
+        let (outs, mut stat) = decode_step(
             rk,
             em,
             ple,
@@ -13805,6 +13886,7 @@ fn decode(
             res.probes[i].push((outs[i].lse, outs[i].probe.clone()));
             res.shas[i].push(outs[i].sha.clone());
         }
+        stat.committed_at = Some(Instant::now());
         res.steps.push(stat);
         if rk.mtp.is_some() && t + 1 < n {
             // FN15's shadow drafter: pass 1 on this step's stream + the committed token at the

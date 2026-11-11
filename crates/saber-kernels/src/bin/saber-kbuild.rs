@@ -38,6 +38,7 @@ const EXTRA_FLAGS: &[(&str, &str)] = &[
     ("saber_attn", "-ffp-contract=off"),
     ("saber_gdn_", "-ffp-contract=off"),
     ("saber_ar_", "-ffp-contract=off"),
+    ("flashnext_ar_host", "-ffp-contract=off"),
     // P27-15: `p27_tree_attn` is the reference's ragged decode translation unit (the `saber_attn` row's
     // reason); `p27_tree_gdn` replaces rx7's recurrent update and is built like it.
     ("p27_tree_", "-ffp-contract=off"),

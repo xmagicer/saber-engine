@@ -1,0 +1,70 @@
+measured_stage,placement,workload,samples,mean_ms,median_ms,p95_ms,min_ms,max_ms
+complete_propose,int8 all-physical,combined,4,184.36771,183.25889,193.62635,175.6622,195.29088
+backbone,int8 all-physical,combined,4,120.2954,118.84483,130.15792,111.36289,132.12904
+full_vocabulary_and_exact_rerank,int8 all-physical,combined,4,60.11381,59.93982,61.12228,59.31919,61.2564
+complete_propose,int8 all-physical,code,2,188.80731,188.80731,194.64252,182.32375,195.29088
+backbone,int8 all-physical,code,2,125.55864,125.55864,131.472,118.98824,132.12904
+full_vocabulary_and_exact_rerank,int8 all-physical,code,2,59.4183,59.4183,59.5075,59.31919,59.51741
+complete_propose,int8 all-physical,prose,2,179.92812,179.92812,183.76744,175.6622,184.19403
+backbone,int8 all-physical,prose,2,115.03216,115.03216,118.3345,111.36289,118.70142
+full_vocabulary_and_exact_rerank,int8 all-physical,prose,2,60.80931,60.80931,61.21169,60.36222,61.2564
+complete_propose,int8 all-P,combined,4,95.18357,94.51516,97.55267,93.68475,98.01918
+backbone,int8 all-P,combined,4,55.8381,55.77474,56.63577,55.086,56.71695
+full_vocabulary_and_exact_rerank,int8 all-P,combined,4,35.98412,35.37577,37.54858,35.25605,37.9289
+complete_propose,int8 all-P,code,2,96.46414,96.46414,97.86368,94.90909,98.01918
+backbone,int8 all-P,code,2,56.44635,56.44635,56.68989,56.17576,56.71695
+full_vocabulary_and_exact_rerank,int8 all-P,code,2,36.66115,36.66115,37.80213,35.3934,37.9289
+complete_propose,int8 all-P,prose,2,93.90299,93.90299,94.09941,93.68475,94.12123
+backbone,int8 all-P,prose,2,55.22985,55.22985,55.35933,55.086,55.37371
+full_vocabulary_and_exact_rerank,int8 all-P,prose,2,35.30709,35.30709,35.35303,35.25605,35.35813
+complete_propose,int8 two-P,combined,4,230.73145,230.80493,231.39151,229.84613,231.46979
+backbone,int8 two-P,combined,4,141.2741,141.2711,141.64294,140.8598,141.69441
+full_vocabulary_and_exact_rerank,int8 two-P,combined,4,85.99915,85.86071,86.63037,85.53993,86.73523
+complete_propose,int8 two-P,code,2,230.65796,230.65796,231.3886,229.84613,231.46979
+backbone,int8 two-P,code,2,141.10555,141.10555,141.32673,140.8598,141.35131
+full_vocabulary_and_exact_rerank,int8 two-P,code,2,86.13758,86.13758,86.67546,85.53993,86.73523
+complete_propose,int8 two-P,prose,2,230.80493,230.80493,230.93366,230.6619,230.94796
+backbone,int8 two-P,prose,2,141.44266,141.44266,141.66923,141.1909,141.69441
+full_vocabulary_and_exact_rerank,int8 two-P,prose,2,85.86071,85.86071,86.01863,85.68525,86.03618
+complete_propose,int8 half-P,combined,4,162.0519,162.20444,162.40775,161.36346,162.43523
+backbone,int8 half-P,combined,4,98.26685,98.26562,98.62578,97.88707,98.64908
+full_vocabulary_and_exact_rerank,int8 half-P,combined,4,60.45305,60.3563,60.96175,60.03877,61.06085
+complete_propose,int8 half-P,code,2,161.80775,161.80775,162.2076,161.36346,162.25203
+backbone,int8 half-P,code,2,97.9623,97.9623,98.02999,97.88707,98.03752
+full_vocabulary_and_exact_rerank,int8 half-P,code,2,60.54981,60.54981,61.00975,60.03877,61.06085
+complete_propose,int8 half-P,prose,2,162.29605,162.29605,162.42131,162.15686,162.43523
+backbone,int8 half-P,prose,2,98.5714,98.5714,98.64131,98.49373,98.64908
+full_vocabulary_and_exact_rerank,int8 half-P,prose,2,60.3563,60.3563,60.39581,60.31241,60.40019
+complete_propose,bf16 all-physical,combined,4,6544.43874,6542.6116,6554.46435,6536.5441,6555.98765
+backbone,bf16 all-physical,combined,4,362.56558,363.09423,365.32648,358.43474,365.63914
+full_vocabulary_and_exact_rerank,bf16 all-physical,combined,4,6176.62104,6176.87561,6185.67548,6165.75064,6186.9823
+complete_propose,bf16 all-physical,code,2,6547.68927,6547.68927,6555.15782,6539.39088,6555.98765
+backbone,bf16 all-physical,code,2,360.99473,360.99473,363.29871,358.43474,363.55471
+full_vocabulary_and_exact_rerank,bf16 all-physical,code,2,6181.23167,6181.23167,6186.40724,6175.48104,6186.9823
+complete_propose,bf16 all-physical,prose,2,6541.1882,6541.1882,6545.3679,6536.5441,6545.83231
+backbone,bf16 all-physical,prose,2,364.13644,364.13644,365.48887,362.63374,365.63914
+full_vocabulary_and_exact_rerank,bf16 all-physical,prose,2,6172.01041,6172.01041,6177.64421,6165.75064,6178.27019
+160 ready candidates to complete draft packet,stock GPU,combined,128,0.52256,0.5224,0.52918,0.51177,0.53415
+160 ready candidates to complete draft packet,stock GPU,code,64,0.5218,0.5217,0.5287,0.51177,0.53229
+160 ready candidates to complete draft packet,stock GPU,prose,64,0.52332,0.52313,0.52922,0.51718,0.53415
+160 ready candidates to complete draft packet,"GPU only, buffered",combined,128,0.42206,0.42458,0.43344,0.3743,0.4539
+160 ready candidates to complete draft packet,"GPU only, buffered",code,64,0.41733,0.4217,0.42903,0.3743,0.4539
+160 ready candidates to complete draft packet,"GPU only, buffered",prose,64,0.42679,0.42813,0.43438,0.41074,0.43776
+160 ready candidates to complete draft packet,CPU 16 + GPU 144,combined,128,0.41234,0.41236,0.42293,0.39804,0.44225
+160 ready candidates to complete draft packet,CPU 16 + GPU 144,code,64,0.41023,0.4111,0.4209,0.39804,0.4246
+160 ready candidates to complete draft packet,CPU 16 + GPU 144,prose,64,0.41446,0.41391,0.42296,0.4033,0.44225
+160 ready candidates to complete draft packet,CPU 32 + GPU 128,combined,128,0.38316,0.38398,0.39043,0.3635,0.40165
+160 ready candidates to complete draft packet,CPU 32 + GPU 128,code,64,0.3799,0.38108,0.38624,0.3635,0.39324
+160 ready candidates to complete draft packet,CPU 32 + GPU 128,prose,64,0.38643,0.38652,0.39174,0.37647,0.40165
+160 ready candidates to complete draft packet,CPU 48 + GPU 112,combined,128,0.36496,0.36518,0.37108,0.3539,0.39268
+160 ready candidates to complete draft packet,CPU 48 + GPU 112,code,64,0.36431,0.36481,0.37026,0.35528,0.39268
+160 ready candidates to complete draft packet,CPU 48 + GPU 112,prose,64,0.36561,0.36558,0.37124,0.3539,0.37863
+160 ready candidates to complete draft packet,CPU 64 + GPU 96,combined,128,0.35709,0.35372,0.38824,0.33604,0.41344
+160 ready candidates to complete draft packet,CPU 64 + GPU 96,code,64,0.35713,0.35252,0.38925,0.33604,0.40259
+160 ready candidates to complete draft packet,CPU 64 + GPU 96,prose,64,0.35705,0.35415,0.37946,0.33728,0.41344
+160 ready candidates to complete draft packet,CPU 80 + GPU 80,combined,128,0.39241,0.38985,0.43258,0.35041,0.44656
+160 ready candidates to complete draft packet,CPU 80 + GPU 80,code,64,0.3935,0.39262,0.42557,0.35041,0.43666
+160 ready candidates to complete draft packet,CPU 80 + GPU 80,prose,64,0.39132,0.38634,0.43638,0.35206,0.44656
+160 ready candidates to complete draft packet,CPU 160 + GPU 0,combined,128,0.51918,0.51961,0.59774,0.42576,0.63227
+160 ready candidates to complete draft packet,CPU 160 + GPU 0,code,64,0.50701,0.51857,0.5637,0.42576,0.5828
+160 ready candidates to complete draft packet,CPU 160 + GPU 0,prose,64,0.53135,0.52028,0.60381,0.47347,0.63227

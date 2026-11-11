@@ -21,6 +21,7 @@ pub mod exec;
 pub mod fn150;
 pub mod fp4local;
 pub mod hand;
+mod host_ar;
 pub mod hc8;
 pub mod keepalive;
 pub mod kern;

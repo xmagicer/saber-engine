@@ -2145,6 +2145,28 @@ mod tests {
         Decls::load(&p).expect("manifests")
     }
 
+    #[test]
+    fn host_ar_emits_one_exact_fixed_grid_for_prefill_and_decode_sizes() {
+        use super::super::{exec::Reduce, host_ar};
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../prebuilt/gfx1201");
+        let decls = Decls::load_for_ar(&path, true).unwrap();
+        let rules = FlashNextRules::prod().unwrap();
+        let mut pair = fake_pair().unwrap();
+        pair.host = true;
+        pair.rules = pair.rules.exact_all();
+        pair.mb = host_ar::slot_bytes(8192);
+        for (rows, decode) in [(1, true), (64, true), (8192, false), (7, true)] {
+            let mut e = Emitter::new(&decls, &rules, Dims::new(2, 0), unbounded());
+            e.ar_decode = decode;
+            pair.reduce(std::slice::from_mut(&mut e), &[1 << 31], rows * super::super::exec::H, false).unwrap();
+            assert_eq!(e.recs.len(), 1);
+            let r = &e.recs[0];
+            assert_eq!((r.plugin, r.sym.as_str()), ("flashnext_ar_host", host_ar::SYMBOL));
+            assert_eq!(r.grid, [host_ar::BLOCKS as u32, 1, 1]);
+        }
+        assert_eq!((pair.calls_exact, pair.calls_wht6), (4, 0));
+    }
+
     /// FN131: every phase-split decode down (`down131::ROUTE` x the four modes) is in
     /// `flashnext_hc131` with its parent's kernarg layout, takes the routed threads, stays at
     /// <= 192 VGPRs with no scratch (the grid stays resident: 112 / 48 workgroups on 32 WGPs at 2+

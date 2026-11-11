@@ -1397,7 +1397,6 @@ impl Builder<'_> {
         //    and the group sum. Five launches ws-f27 found by writing a CHAIN, every one of them
         //    invisible to a staged replay because a staged replay seeds their outputs.
         let steps = self.shape.reqs * cfg.selector_positions();
-        let m_pad = pad_rows(cfg, self.shape) as u32;
         let head_hidden = self.at("head.hidden")?;
         self.push(
             "head.sample_rows",
@@ -1410,6 +1409,134 @@ impl Builder<'_> {
                 ("out", head_hidden),
             ],
         )?;
+        let y = self.at("head.y")?;
+        self.proposal_logits(p, head_hidden, y, steps)?;
+
+        // 5. the selector's own top-16 over the reranked vocabulary row, the anchor gather and the
+        //    projection. The selection writes the i64 ids its consumers declare, into the ONE
+        //    region all of them bind — see the module doc.
+        let svals = self.at("sel.vals")?;
+        let cand64 = self.at("sel.cand64")?;
+        self.push(
+            "selector.candidate_topk",
+            p,
+            DflashOp::SelectorTopk,
+            DflashShape::rerank(steps, vloc, h, cfg.selector_top_k),
+            &[("x", y), ("vals", svals), ("idx", cand64)],
+        )?;
+        // ---- THE CANDIDATE SEAM ------------------------------------------------------------
+        //
+        // `selector.candidate_topk` has just written the best 16 of THIS RANK'S HALF of the
+        // vocabulary, as f32 values and SHARD-LOCAL i64 columns. At TP=1 that is the row's own
+        // top-16 and its consumers read it where it lies. At TP > 1 it is half an answer twice,
+        // and what follows is the merge: the two ranks swap their 16 pairs over the rendezvous
+        // socket, each adds `rank * vocab_local` to its own columns, and the top-16 of the 32 is
+        // what the codebooks are then gathered by. That merge is HOST work — the same law and the
+        // same transport as `logits.gather` — so the two ops that read a whole row are a captured
+        // TAIL of their own and the host writes `sel.cand64` back, GLOBAL, in between.
+        let seam = self.collectives.is_some();
+        let tail = if seam { DraftPhase::BackboneTail } else { p };
+        let anchor = self.at("sel.anchor")?;
+        self.push(
+            "selector.anchor_ids",
+            p,
+            DflashOp::RowGather,
+            DflashShape::new(self.shape.reqs, 4, m),
+            &[
+                ("in", self.binds.input_ids),
+                ("idx", self.binds.anchor_indices),
+                ("out", anchor),
+            ],
+        )?;
+        let proj = self.at("sel.proj")?;
+        let w_hp = self.w("selector.hidden_projection", "w")?;
+        let op = self.bgemm(steps);
+        self.push(
+            "selector.hidden_projection",
+            p,
+            op,
+            DflashShape::new(steps, cfg.selector_rank, h),
+            &[("a", head_hidden), ("w", w_hp), ("c", proj)],
+        )?;
+        let scores = self.at("sel.scores")?;
+        let mut sb: Vec<(&str, DeviceAddr)> = vec![
+            ("cand", cand64),
+            ("anchor", anchor),
+            ("unary", svals),
+            ("hidden", proj),
+            ("out", scores),
+        ];
+        let sc_weights: Vec<(String, DeviceAddr)> = self
+            .binds
+            .weights
+            .get("selector.score_edges")
+            .cloned()
+            .unwrap_or_default();
+        for (k, a) in &sc_weights {
+            sb.push((k.as_str(), *a));
+        }
+        self.push(
+            "selector.score_edges",
+            tail,
+            DflashOp::SelectorScore,
+            DflashShape::selector(
+                steps,
+                cfg.selector_positions(),
+                cfg.selector_rank,
+                cfg.selector_top_k,
+            ),
+            &sb,
+        )?;
+
+        // 6. the walk: the draft block, one request per program, on the device.
+        let tokens = self.at("out.tokens")?;
+        let realized = self.at("out.realized")?;
+        self.push(
+            "selector.walk",
+            tail,
+            DflashOp::SelectorWalk,
+            DflashShape::rerank(
+                self.shape.reqs,
+                cfg.selector_positions(),
+                cfg.selector_top_k,
+                cfg.selector_top_k,
+            ),
+            &[
+                ("scores", scores),
+                ("candidates", cand64),
+                ("req_state", self.binds.req_state),
+                ("tokens", tokens),
+                ("realized", realized),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Fill the local vocabulary logits consumed by the selector and its TP merge.
+    fn proposal_logits(
+        &mut self,
+        p: DraftPhase,
+        head_hidden: DeviceAddr,
+        y: DeviceAddr,
+        steps: u32,
+    ) -> Result<(), ForwardError> {
+        let cfg = self.cfg;
+        let h = cfg.hidden;
+        let vloc = cfg.vocab_local();
+        if self.rules.head.full_vocab_b1 && self.shape.reqs == 1 {
+            let weight = self.w("head.rerank", "w8")?;
+            let scale = self.w("head.rerank", "ws")?;
+            let dense = dflash::resolve_head_w8_b1(steps, vloc, h, self.rules)
+                .map_err(|e| ForwardError::Device(format!("full draft head: {e}")))?;
+            return self.push_desc(
+                "head.full_w8",
+                p,
+                dense,
+                Shape::new(steps, vloc, h),
+                &[("a", head_hidden), ("w", weight), ("ws", scale), ("c", y)],
+            );
+        }
+        let m_pad = pad_rows(cfg, self.shape) as u32;
         let x_pad = self.at("head.x_pad")?;
         let xs = self.at("head.xs")?;
         self.push(
@@ -1428,7 +1555,6 @@ impl Builder<'_> {
         )?;
 
         // 3. the int2 head, its two-pass selection and the gather that selection needs.
-        let y = self.at("head.y")?;
         let bmax = self.at("head.bmax")?;
         let bidx = self.at("head.bidx")?;
         let wq = self.w("head.int2", "wq")?;
@@ -1527,104 +1653,6 @@ impl Builder<'_> {
             rr,
             Shape::new(rr_shape.m, rr_shape.n, rr_shape.k),
             &rb,
-        )?;
-
-        // 5. the selector's own top-16 over the reranked vocabulary row, the anchor gather and the
-        //    projection. The selection writes the i64 ids its consumers declare, into the ONE
-        //    region all of them bind — see the module doc.
-        let svals = self.at("sel.vals")?;
-        let cand64 = self.at("sel.cand64")?;
-        self.push(
-            "selector.candidate_topk",
-            p,
-            DflashOp::SelectorTopk,
-            DflashShape::rerank(steps, vloc, h, cfg.selector_top_k),
-            &[("x", y), ("vals", svals), ("idx", cand64)],
-        )?;
-        // ---- THE CANDIDATE SEAM ------------------------------------------------------------
-        //
-        // `selector.candidate_topk` has just written the best 16 of THIS RANK'S HALF of the
-        // vocabulary, as f32 values and SHARD-LOCAL i64 columns. At TP=1 that is the row's own
-        // top-16 and its consumers read it where it lies. At TP > 1 it is half an answer twice,
-        // and what follows is the merge: the two ranks swap their 16 pairs over the rendezvous
-        // socket, each adds `rank * vocab_local` to its own columns, and the top-16 of the 32 is
-        // what the codebooks are then gathered by. That merge is HOST work — the same law and the
-        // same transport as `logits.gather` — so the two ops that read a whole row are a captured
-        // TAIL of their own and the host writes `sel.cand64` back, GLOBAL, in between.
-        let seam = self.collectives.is_some();
-        let tail = if seam { DraftPhase::BackboneTail } else { p };
-        let anchor = self.at("sel.anchor")?;
-        self.push(
-            "selector.anchor_ids",
-            p,
-            DflashOp::RowGather,
-            DflashShape::new(self.shape.reqs, 4, m),
-            &[
-                ("in", self.binds.input_ids),
-                ("idx", self.binds.anchor_indices),
-                ("out", anchor),
-            ],
-        )?;
-        let proj = self.at("sel.proj")?;
-        let w_hp = self.w("selector.hidden_projection", "w")?;
-        let op = self.bgemm(steps);
-        self.push(
-            "selector.hidden_projection",
-            p,
-            op,
-            DflashShape::new(steps, cfg.selector_rank, h),
-            &[("a", head_hidden), ("w", w_hp), ("c", proj)],
-        )?;
-        let scores = self.at("sel.scores")?;
-        let mut sb: Vec<(&str, DeviceAddr)> = vec![
-            ("cand", cand64),
-            ("anchor", anchor),
-            ("unary", svals),
-            ("hidden", proj),
-            ("out", scores),
-        ];
-        let sc_weights: Vec<(String, DeviceAddr)> = self
-            .binds
-            .weights
-            .get("selector.score_edges")
-            .cloned()
-            .unwrap_or_default();
-        for (k, a) in &sc_weights {
-            sb.push((k.as_str(), *a));
-        }
-        self.push(
-            "selector.score_edges",
-            tail,
-            DflashOp::SelectorScore,
-            DflashShape::selector(
-                steps,
-                cfg.selector_positions(),
-                cfg.selector_rank,
-                cfg.selector_top_k,
-            ),
-            &sb,
-        )?;
-
-        // 6. the walk: the draft block, one request per program, on the device.
-        let tokens = self.at("out.tokens")?;
-        let realized = self.at("out.realized")?;
-        self.push(
-            "selector.walk",
-            tail,
-            DflashOp::SelectorWalk,
-            DflashShape::rerank(
-                self.shape.reqs,
-                cfg.selector_positions(),
-                cfg.selector_top_k,
-                cfg.selector_top_k,
-            ),
-            &[
-                ("scores", scores),
-                ("candidates", cand64),
-                ("req_state", self.binds.req_state),
-                ("tokens", tokens),
-                ("realized", realized),
-            ],
         )?;
         Ok(())
     }
@@ -2338,6 +2366,31 @@ mod tests {
             anchor_indices: fresh(),
             req_state: fresh(),
             weights,
+        }
+    }
+
+    #[test]
+    fn full_vocab_b8_uses_the_fp8_head_at_b1_and_int2_at_b2() {
+        let cfg = DflashConfig::qwen38_dflash2(2, 7);
+        let mut binds = fake_binds(&cfg);
+        binds.weights.insert(
+            "head.rerank".into(),
+            vec![("w8".into(), binds.arena), ("ws".into(), binds.one_f32)],
+        );
+        let mut rules = DflashRules::prod_dflash().unwrap();
+        rules.head.full_vocab_b1 = true;
+        let ar = SaberRules::prod_saber().unwrap();
+        let head = HeadRules::prod_head().unwrap();
+        for batch in [1, 2] {
+            let plan = DraftPlan::build(&cfg, fake_shape(&cfg, batch), &binds, &rules, &head, 0, Some(&ar)).unwrap();
+            let full = plan.steps.iter().find(|s| s.name == "head.full_w8");
+            assert_eq!(full.is_some(), batch == 1);
+            assert_eq!(plan.steps.iter().any(|s| s.name == "head.int2"), batch == 2);
+            assert!(plan.steps.iter().any(|s| s.name == "selector.candidate_topk"));
+            if let Some(step) = full {
+                assert_eq!(step.args.get("w"), Some(binds.arena));
+                assert_eq!(step.args.get("ws"), Some(binds.one_f32));
+            }
         }
     }
 
