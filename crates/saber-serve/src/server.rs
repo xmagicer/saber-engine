@@ -974,6 +974,7 @@ async fn chat_blocking(
     let mut logprob_entries: Vec<Vec<LogprobEntry>> = vec![Vec::new(); n];
     let mut prompt_logprobs = None;
 
+    let (_guard, done) = blocking_guard(&state, submission.id);
     let mut events = submission.events;
     let mut live = n;
     while live > 0 {
@@ -995,6 +996,8 @@ async fn chat_blocking(
             live -= 1;
         }
     }
+
+    done.store(true, Ordering::Release); // finished: the guard's drop is ordinary teardown
 
     // THE ENGINE ENDED A CHOICE WITH A REASON (ws-k18): the request is an error, not a reply with
     // an `abort` finish the client would have to guess at. prod answers an engine exception on a
@@ -1367,6 +1370,23 @@ impl Drop for DisconnectGuard {
     }
 }
 
+/// Non-streaming requests have no response body to drop, so the guard rides the handler future:
+/// hyper drops that future when the client disconnects mid-generation, and this aborts the
+/// engine request (otherwise it generates to its limit with nobody listening).
+fn blocking_guard(
+    state: &Arc<ServerState>,
+    id: crate::engine::RequestId,
+) -> (DisconnectGuard, Arc<AtomicBool>) {
+    let done = Arc::new(AtomicBool::new(false));
+    let guard = DisconnectGuard {
+        state: Arc::clone(state),
+        request_ids: vec![id],
+        done: Arc::clone(&done),
+        once: AbortOnce::new(),
+    };
+    (guard, done)
+}
+
 /// A stream that owns a [`DisconnectGuard`], so dropping the body runs it.
 struct GuardedStream<S> {
     inner: S,
@@ -1463,6 +1483,7 @@ async fn completions(
         .collect();
     let mut all_logprobs: Vec<CompletionLogprobs> =
         (0..n).map(|_| CompletionLogprobs::default()).collect();
+    let (_guard, done) = blocking_guard(&state, submission.id);
     let mut events = submission.events;
     let mut live = n;
     while live > 0 {
@@ -1495,6 +1516,8 @@ async fn completions(
             live -= 1;
         }
     }
+
+    done.store(true, Ordering::Release);
 
     let mut choices = Vec::with_capacity(n);
     let mut completion_tokens = 0u64;

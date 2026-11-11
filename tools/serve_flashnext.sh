@@ -178,9 +178,13 @@ died() {
 # (the engine's --xtier-p2p-dir): the boot fill / the valve's pool bounce use it; no pool = no mount
 # and the engine names the host route on its `fnfill` lines.
 # shellcheck source=capture/p2p_mounts.sh
-. "$REPO/tools/capture/p2p_mounts.sh"
+# P2P is an optimisation only (a kernel with amdgpu.p2pmem_mb): without the helper, or without a pool, the
+# array stays empty and the engine's boot fill takes the host route.
 P2P=()
-p2p_mounts P2P
+if [ -r "$REPO/tools/capture/p2p_mounts.sh" ]; then
+  . "$REPO/tools/capture/p2p_mounts.sh"
+  p2p_mounts P2P
+fi
 # GPU_MAX_HW_QUEUES=3: the user's rule 10-26 (other devs report a slowdown at 4 or more); the env var overrides for a probe
 $CTR rm -f "$CNAME" >/dev/null 2>&1 || true
 $CTR run -d --name "$CNAME" --security-opt label=disable --security-opt seccomp=unconfined \

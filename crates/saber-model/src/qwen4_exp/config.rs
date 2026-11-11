@@ -11,8 +11,10 @@
 //! * a required key that is absent — by its dotted path;
 //! * a value the forward cannot run (a layer schedule that disagrees with
 //!   `full_attention_interval`, a PLE layer out of range, an indexer budget upstream refuses, an
-//!   MX spec that is not e2m1 + e8m0 per 32, a Quark `exclude` entry that names no module of this
-//!   model, a dense linear that Quark would quantize).
+//!   MX spec that is not e2m1 + e8m0 per 32 (a stated `zero_point_type` other than `int32`), a
+//!   Quark `exclude` entry that names no module of this model -- a linear, or one of the
+//!   unquantized PLE shards / vision embeds the 2026-10-26 revision lists -- or a dense linear
+//!   that Quark would quantize).
 //!
 //! Values the checkpoint omits and upstream fills in are not silent defaults: each is a
 //! [`DeclaredDefault`] with the upstream file that sets it, listed in
@@ -1028,11 +1030,22 @@ impl Qwen4ExpConfig {
                     .ok_or_else(|| err(format!("quantization_config.exclude: non-string {x}")))
             })
             .collect::<Result<_, _>>()?;
-        let known = self.linear_modules();
+        // Every entry must name a module of THIS model: a linear (target, MTP, vision), or one of
+        // the unquantized non-linear modules AMD's 2026-10-26 revision also lists (the PLE table
+        // shards, the vision patch embed and position table). Both sets are derived from the
+        // config's own counts, so a typo or an out-of-range index is still refused.
+        let linears = self.linear_modules();
+        let others = self.unquantized_nonlinear_modules();
+        let known: std::collections::HashSet<&str> = linears
+            .iter()
+            .chain(others.iter())
+            .map(String::as_str)
+            .collect();
         for e in &exclude {
-            if !known.iter().any(|k| k == e) {
+            if !known.contains(e.as_str()) {
                 return Err(err(format!(
-                    "quantization_config.exclude: `{e}` is not a linear module of this model"
+                    "quantization_config.exclude: `{e}` is not a linear module of this model \
+                     (nor one of its unquantized embedding tables)"
                 )));
             }
         }
@@ -1142,6 +1155,25 @@ impl Qwen4ExpConfig {
         out
     }
 
+    /// The non-linear modules a Quark `exclude` may also name (AMD's 2026-10-26 config revision
+    /// lists them; they are bf16 in the shards either way): the PLE n-gram table's
+    /// `split_ngram_parts` shards at each PLE layer, the vision `patch_embed.proj` (a conv) and
+    /// `pos_embed` (an embedding).
+    #[must_use]
+    pub fn unquantized_nonlinear_modules(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for l in self.ple.layer_indices() {
+            for s in 0..self.ple.split_parts {
+                out.push(format!(
+                    "model.language_model.layers.{l}.ple.ple_embedding.ngram_embedding.shard_{s}"
+                ));
+            }
+        }
+        out.push("model.visual.patch_embed.proj".into());
+        out.push("model.visual.pos_embed".into());
+        out
+    }
+
     /// The main model's dense (non-expert) linears: the set Quark must leave in bf16.
     #[must_use]
     pub fn main_dense_linears(&self) -> Vec<String> {
@@ -1214,6 +1246,10 @@ fn mx_spec(mut s: Fields<'_>, dynamic: bool) -> Result<MxSpec, ModelError> {
     s.expect("symmetric", &Value::Null)?;
     s.expect("round_method", &Value::from("half_even"))?;
     s.expect("scale_type", &Value::from("float"))?;
+    // Quark 0.14 (AMD's 2026-10-26 config revision) states the zero-point dtype; 0.13 omitted
+    // it. MX is symmetric (no zero point is stored or applied), so the only accepted value is
+    // Quark's default, `int32`, and absence means the same.
+    s.expect_if_present("zero_point_type", &Value::from("int32"))?;
     s.expect("scale_format", &Value::from("e8m0"))?;
     s.expect("scale_calculation_mode", &Value::from("even"))?;
     s.expect("mx_element_dtype", &Value::Null)?;

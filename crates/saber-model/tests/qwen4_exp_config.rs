@@ -3,7 +3,9 @@
 //!
 //! The two fixtures under `tests/data/` are byte copies of the checkpoints' own `config.json`
 //! (`/mnt/nvme/models/Qwen3.8-Flash-Next-Quark-MXFP4` and `-NVFP4`); when the checkpoint is on
-//! this box, `fixture_is_the_checkpoints_config` holds them to it.
+//! this box, `fixture_is_the_checkpoints_config` holds them to it. `qwen4_exp_quark_20261026`
+//! is the hub's later revision of the Quark file (see [`QUARK_1026`]); the box's checkpoint is
+//! the original, so it is held to the hub copy only.
 
 use std::path::Path;
 
@@ -15,6 +17,12 @@ use serde_json::Value;
 const QUARK: &str = include_str!("data/qwen4_exp_quark.config.json");
 const NVFP4: &str = include_str!("data/qwen4_exp_nvfp4.config.json");
 const FP4LOCAL: &str = include_str!("data/qwen4_exp_fp4local.config.json");
+/// AMD's 2026-10-26 revision of the Quark repo's `config.json` ("expand exclude for MTP experts +
+/// embed"; hub commit b71e28afcd4b, blob 721191e7b4a5): a byte copy of
+/// `https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4/raw/main/config.json`. The shards
+/// did not change; the revision adds `zero_point_type: int32` to both MX specs, Quark version
+/// 0.14, and 1,667 exclude entries (2,462 total, none removed).
+const QUARK_1026: &str = include_str!("data/qwen4_exp_quark_20261026.config.json");
 
 fn parse(s: &str) -> Qwen4ExpConfig {
     Qwen4ExpConfig::from_config_json(s).expect("the real config parses")
@@ -313,6 +321,125 @@ fn refuses_a_quark_exclude_that_does_not_match_the_model() {
         e.contains("layers.7.self_attn.o_proj") && e.contains("not excluded"),
         "{e}"
     );
+}
+
+fn doctor_1026(f: impl FnOnce(&mut Value)) -> String {
+    let mut v: Value = serde_json::from_str(QUARK_1026).unwrap();
+    f(&mut v);
+    refused(&v)
+}
+
+/// The 2026-10-26 Quark config parses to the same model as the original: identical text /
+/// vision facts and MX specs; only the exclude list (a superset) and the version differ.
+#[test]
+fn quark_1026_config_parses_to_the_same_model() {
+    let old = parse(QUARK);
+    let new = parse(QUARK_1026);
+    let (
+        QuantConfig::QuarkMxfp4 {
+            weight: ow,
+            input: oi,
+            exclude: oe,
+            version: ov,
+        },
+        QuantConfig::QuarkMxfp4 {
+            weight: nw,
+            input: ni,
+            exclude: ne,
+            version: nv,
+        },
+    ) = (&old.quant, &new.quant)
+    else {
+        panic!("both must be Quark");
+    };
+    assert_eq!(
+        (ow, oi),
+        (nw, ni),
+        "the weight / input MX specs must not change"
+    );
+    assert_eq!(
+        (ov.as_str(), nv.as_str()),
+        ("0.13+c3526c2f56c", "0.14+67d3ddd8fc")
+    );
+    assert_eq!((oe.len(), ne.len()), (795, 2462));
+    assert!(oe.iter().all(|e| ne.contains(e)), "nothing was removed");
+    let added: Vec<&String> = ne.iter().filter(|e| !oe.contains(e)).collect();
+    let count = |f: &dyn Fn(&str) -> bool| added.iter().filter(|e| f(e)).count();
+    assert_eq!(count(&|e| e.starts_with("mtp.layers.0.mlp.experts.")), 1536);
+    assert_eq!(
+        count(&|e| e.contains(".ple.ple_embedding.ngram_embedding.shard_")),
+        128
+    );
+    for m in [
+        "mtp.fc_embedding",
+        "model.visual.patch_embed.proj",
+        "model.visual.pos_embed",
+    ] {
+        assert!(added.iter().any(|e| e.as_str() == m), "{m}");
+    }
+    assert_eq!(added.len(), 1536 + 128 + 3);
+    let mut same = new.clone();
+    same.quant = old.quant.clone();
+    assert_eq!(
+        same, old,
+        "the two revisions' model facts must be identical"
+    );
+}
+
+#[test]
+fn quark_1026_refuses_a_zero_point_type_other_than_int32() {
+    for spec in ["weight", "input_tensors"] {
+        let e = doctor_1026(|v| {
+            v["quantization_config"]["global_quant_config"][spec]["zero_point_type"] =
+                Value::from("int8");
+        });
+        assert!(
+            e.contains(&format!(
+                "quantization_config.global_quant_config.{spec}.zero_point_type"
+            )) && e.contains("int8"),
+            "{e}"
+        );
+    }
+    // Absent is the 0.13 file (parsed above); `int32` is the 0.14 file. Both stand.
+}
+
+#[test]
+fn quark_1026_refuses_exclude_entries_that_name_nothing() {
+    for bad in [
+        // Expert index past num_experts (512).
+        "mtp.layers.0.mlp.experts.512.gate_proj",
+        // MTP layer index past mtp_num_hidden_layers (1).
+        "mtp.layers.1.mlp.experts.0.up_proj",
+        // PLE shard past split_ngram_parts (128).
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_128",
+        // PLE shards at a layer the PLE does not run at.
+        "model.language_model.layers.2.ple.ple_embedding.ngram_embedding.shard_0",
+        // A typo of an allowed non-linear.
+        "model.visual.pos_embeds",
+    ] {
+        let e = doctor_1026(|v| {
+            v["quantization_config"]["exclude"]
+                .as_array_mut()
+                .unwrap()
+                .push(Value::from(bad));
+        });
+        assert!(e.contains(bad) && e.contains("not a linear"), "{bad}: {e}");
+    }
+}
+
+#[test]
+fn quark_1026_refuses_a_main_dense_linear_left_out_of_exclude() {
+    for m in [
+        "model.language_model.layers.7.self_attn.o_proj",
+        "model.language_model.layers.1.ple.key_proj",
+        "lm_head",
+    ] {
+        let e = doctor_1026(|v| {
+            let ex = v["quantization_config"]["exclude"].as_array_mut().unwrap();
+            ex.retain(|x| x.as_str() != Some(m));
+        });
+        assert!(e.contains(m) && e.contains("not excluded"), "{m}: {e}");
+    }
 }
 
 /// FN144: the FP4-Local config -- the same text / vision facts as Quark; 545 modules: 48 CSF

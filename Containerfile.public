@@ -17,6 +17,7 @@ RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-p
     && rustup component add clippy rustfmt \
     && cargo install bindgen-cli --locked \
     && python3 -m venv /opt/saber-py \
+    && /opt/saber-py/bin/pip install --no-cache-dir -q numpy \
     && chmod -R a+rwX /opt/rust /opt/saber-py
 ENV LIBCLANG_PATH=/usr/lib/llvm-18/lib
 ENV VIRTUAL_ENV=/opt/saber-py ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm HIP_PLATFORM=amd

@@ -9,6 +9,11 @@
 #     packs from `tools/fetch_packs.sh 27b-tp1`, on HIP device DEVICE (default 0), container
 #     saber-27b-tp1-serve; defaults MAX_CTX 65536, MAX_SEQS 4, BATCHES 1,2,4 (every env knob below
 #     still overrides). `--tp 1 stop` stops only the TP=1 container. TP=2 (`--tp 2`) is the default.
+#   tools/serve_27b.sh --weights quark [--tp 1] ...   # amd/Qwen3.8-27B-Quark-AWQ-MXFP4 instead of the NVFP4 packs
+#     (WEIGHTS=quark in the environment does the same): the qwen38-27b-quark-awq-mxfp4[-tp1] target +
+#     the qwen38-dflash2-drafter-quarkhead[-tp1] drafter from `tools/fetch_packs.sh 27b-quark[-tp1]` (or
+#     tools/build_packs.sh), and that checkpoint's own tokenizer (.cache/quark27b.tokenizer.json).
+#     TIER / DRAFT / TOKENIZER / CHAT_TEMPLATE override any of them (paths as the container sees them).
 #   SERVE_PREFIX="/opt/rocm/bin/rocprofv3 --kernel-trace -f csv -d DIR --" tools/serve_27b.sh ...   # CMP27D: a DIAGNOSTIC tool wrapped around `saber serve` (both ranks)
 #   PORT=8100 MAX_CTX=16384 WIDTHS=1,5,8 tools/serve_27b.sh ...   # port / per-sequence context (default 262144) / verify-width ladder (default 1,8)
 #   DRAFT_BLOCK=4 WIDTHS=1,4 tools/serve_27b.sh ...   # P27-7: the drafter's block (default 8; 4 = the priced option, GDN slots 65 -> 33)
@@ -33,6 +38,7 @@ SHARED=${SABER_SHARED:-$HOME/saber-cache}
 # The launcher's own leading words, in any order: `--tp 1|2`, `--no-build`, `stop`.
 TP_GIVEN=${TP:+env}
 TP=${TP:-2}
+WEIGHTS=${WEIGHTS:-nvfp4}
 BUILD=1
 STOP=0
 while [ $# -gt 0 ]; do
@@ -40,6 +46,8 @@ while [ $# -gt 0 ]; do
     --tp) TP=${2:-}; TP_GIVEN=flag; shift; [ $# -gt 0 ] && shift ;;
     --tp=*) TP=${1#*=}; TP_GIVEN=flag; shift ;;
     --no-build) BUILD=0; shift ;;
+    --weights) WEIGHTS=${2:-}; shift; [ $# -gt 0 ] && shift ;;
+    --weights=*) WEIGHTS=${1#*=}; shift ;;
     stop) STOP=1; shift ;;
     *) break ;;
   esac
@@ -74,29 +82,34 @@ if [ "$STOP" = 1 ]; then
   exit 0
 fi
 
+case "$WEIGHTS" in
+  nvfp4) Q=nvfp4-devfinal; QD=; QF= ;;
+  quark) Q=quark-awq-mxfp4; QD=-quarkhead; QF=-quark ;;
+  *) echo "--weights $WEIGHTS: nvfp4 (the default) or quark" >&2; exit 2 ;;
+esac
 CNAME=${CNAME:-$TP_DEF_CNAME}
 if [ "$TP" = 2 ]; then
   MAX_CTX=${MAX_CTX:-262144}
-  TIER=${TIER:-qwen38-27b-nvfp4-devfinal-fp8head}
-  DRAFT=${DRAFT:-qwen38-dflash2-drafter-fp8head}
+  if [ "$WEIGHTS" = quark ]; then TIER=${TIER:-qwen38-27b-$Q}; DRAFT=${DRAFT:-qwen38-dflash2-drafter$QD}
+  else TIER=${TIER:-qwen38-27b-nvfp4-devfinal-fp8head}; DRAFT=${DRAFT:-qwen38-dflash2-drafter-fp8head}; fi
   TP_ARGS="--engine-tp 2 --engine-device 0 --engine-peer-device 1"
   HIP_DEVICES=${HIP_DEVICES:-0,1}
   BATCHES=${BATCHES:-1,2,3,4,8}
   MAX_SEQS=${MAX_SEQS:-8}
-  FETCH=27b
+  FETCH=27b$QF
 else
   # One card. The container sees only HIP device DEVICE, so inside it the engine's device is 0.
   [ -z "${HIP_DEVICES:-}" ] || { echo "TP=1 takes DEVICE=<one HIP device>, not HIP_DEVICES" >&2; exit 2; }
   DEVICE=${DEVICE:-0}
   [[ "$DEVICE" =~ ^[0-9]+$ ]] || { echo "DEVICE=$DEVICE: TP=1 serves on ONE HIP device index" >&2; exit 2; }
   MAX_CTX=${MAX_CTX:-65536}
-  TIER=${TIER:-qwen38-27b-nvfp4-devfinal-tp1-fp8head}
-  DRAFT=${DRAFT:-qwen38-dflash2-drafter-tp1-fp8head}
+  if [ "$WEIGHTS" = quark ]; then TIER=${TIER:-qwen38-27b-$Q-tp1}; DRAFT=${DRAFT:-qwen38-dflash2-drafter$QD-tp1}
+  else TIER=${TIER:-qwen38-27b-nvfp4-devfinal-tp1-fp8head}; DRAFT=${DRAFT:-qwen38-dflash2-drafter-tp1-fp8head}; fi
   TP_ARGS="--engine-tp 1 --engine-device 0"
   HIP_DEVICES=$DEVICE
   BATCHES=${BATCHES:-1,2,4}
   MAX_SEQS=${MAX_SEQS:-4}
-  FETCH=27b-tp1
+  FETCH=27b$QF-tp1
 fi
 # Explicit compatibility profile for hosts without GPU peer access. The runtime image must
 # provide RCCL >= 2.30.4; it need not be installed in the build image. Native P2P is unchanged.
@@ -110,6 +123,11 @@ if [ -n "${RCCL_LIB:-}" ]; then
   COLLECTIVE_ARGS+=(--engine-rccl-lib "$RCCL_LIB")
   COLLECTIVE_ENV=(-e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=0 -e NCCL_PROTO=Simple)
 fi
+
+if [ "$WEIGHTS" = quark ]; then TOKENIZER=${TOKENIZER:-/work/.cache/quark27b.tokenizer.json}
+else TOKENIZER=${TOKENIZER:-/work/.cache/template_corpus.tokenizer.json}; fi
+CHAT_TEMPLATE=${CHAT_TEMPLATE:-/work/.cache/template_corpus.jinja}
+
 # FN66: `--warm-prompts FILE` -- the file is copied where the container sees it ($OUT) and the
 # launcher reports ready only after the server's `warmprompts done` line.
 ARGS=()
@@ -155,15 +173,16 @@ else
   done
 fi
 if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ":$PORT\$"; then echo "port $PORT is already in use" >&2; exit 1; fi
-for f in "$REPO/.cache/template_corpus.tokenizer.json" "$REPO/.cache/template_corpus.jinja"; do
+for f in "$TOKENIZER" "$CHAT_TEMPLATE"; do
+  case "$f" in /work/*) f=$REPO/${f#/work/} ;; esac
   [ -f "$f" ] || { echo "missing $f (the 27B serve plane's tokenizer / chat template; run tools/fetch_packs.sh $FETCH)" >&2; exit 1; }
 done
 [ -d "$PACKS/$TIER" ] && [ -d "$PACKS/$DRAFT" ] || { echo "missing pack $PACKS/$TIER or $PACKS/$DRAFT (run tools/fetch_packs.sh $FETCH)" >&2; exit 1; }
 if [ "$TP" = 1 ]; then
   for f in "$PACKS/$TIER/rank0.pack" "$PACKS/$DRAFT/rank0.pack"; do
-    [ -f "$f" ] || { echo "missing $f (TP=1 needs the single-card packs: run tools/fetch_packs.sh 27b-tp1)" >&2; exit 1; }
+    [ -f "$f" ] || { echo "missing $f (TP=1 needs the single-card packs: run tools/fetch_packs.sh $FETCH)" >&2; exit 1; }
   done
-  [ ! -e "$PACKS/$TIER/rank1.pack" ] || { echo "$PACKS/$TIER is a TP=2 pack (it has rank1.pack); TP=1 needs the -tp1 packs from tools/fetch_packs.sh 27b-tp1" >&2; exit 1; }
+  [ ! -e "$PACKS/$TIER/rank1.pack" ] || { echo "$PACKS/$TIER is a TP=2 pack (it has rank1.pack); TP=1 needs the -tp1 packs from tools/fetch_packs.sh $FETCH" >&2; exit 1; }
 fi
 
 if [ "$BUILD" = 1 ]; then
@@ -178,7 +197,7 @@ fi
 CACHE_REAL=$(readlink -f "$REPO/.cache")
 SERVE_CMD="$SABER serve --engine real $TP_ARGS \
   --hip-lib /opt/rocm/lib/libamdhip64.so.7 --pack /packs/$TIER --prebuilt ${PREBUILT:-prebuilt/gfx1201} \
-  --tokenizer /work/.cache/template_corpus.tokenizer.json --chat-template /work/.cache/template_corpus.jinja \
+  --tokenizer $TOKENIZER --chat-template $CHAT_TEMPLATE \
   --engine-max-ctx $MAX_CTX --engine-prefill-rows 96,128,192,256,320,384,512,768,1024,1536,2048 \
   --engine-decode-batches $BATCHES --engine-decode-widths ${WIDTHS:-1,8} --engine-max-seqs $MAX_SEQS --engine-draft-block ${DRAFT_BLOCK:-8} --engine-draft-pack /packs/$DRAFT \
   --engine-budget-mib ${BUDGET_MIB:-30500} --engine-rectangular-widths --served-model-name $MODEL --host $HOST --port $PORT ${COLLECTIVE_ARGS[*]} ${ARGS[*]}"

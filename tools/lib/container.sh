@@ -8,9 +8,15 @@
 #   CTR_GPU   the GPU device nodes and the groups that may open them
 #             podman: `--group-add keep-groups` (rootless podman passes the caller's groups through)
 #             docker: the numeric gids of /dev/kfd and /dev/dri/render* (docker has no keep-groups)
-#   CTR_USER  docker only: `--user UID:GID` so files written into the bind-mounted repo (.cache,
-#             build output) stay yours instead of root's; empty under rootless podman, where the
-#             container's root already maps to you.
+#   CTR_USER  docker only (empty under rootless podman), the per-run options docker needs:
+#             `--user UID:GID` so files written into the bind-mounted repo (.cache, build output)
+#             stay yours instead of root's (rootless podman's container root already maps to you);
+#             `--ulimit nofile=1048576:1048576`, because docker's default open-file limit is 1024
+#             and the engine / pack builders hold every checkpoint shard and pack file open
+#             ("too many open files" otherwise). Not passed to podman: rootless podman already
+#             inherits a high limit, and asking above the host hard limit fails the run.
+#             Every `$CTR run` that opens shards, checkpoints or packs expands "${CTR_USER[@]}"
+#             (dev.sh, hipcc.sh, build_packs.sh, serve_27b.sh, serve_flashnext.sh).
 if [ -z "${SABER_CONTAINER:-}" ]; then
   if command -v podman >/dev/null 2>&1; then SABER_CONTAINER=podman
   elif command -v docker >/dev/null 2>&1; then SABER_CONTAINER=docker
@@ -28,6 +34,6 @@ else
     [ -e "$_n" ] || continue
     _g=$(stat -c %g "$_n"); case " ${CTR_GPU[*]} " in *" $_g "*) ;; *) CTR_GPU+=(--group-add "$_g") ;; esac
   done
-  CTR_USER=(--user "$(id -u):$(id -g)" -e HOME=/tmp)
+  CTR_USER=(--user "$(id -u):$(id -g)" -e HOME=/tmp --ulimit nofile=1048576:1048576)
 fi
 unset _g _n

@@ -81,6 +81,19 @@ impl<'a> Fields<'a> {
         Ok(())
     }
 
+    /// Absent, or present and exactly `want` (a key some revisions of a checkpoint state and
+    /// others omit, with one meaning either way).
+    pub(crate) fn expect_if_present(&mut self, key: &str, want: &Value) -> Result<(), ModelError> {
+        match self.optional(key) {
+            None => Ok(()),
+            Some(v) if v == want => Ok(()),
+            Some(v) => Err(err(format!(
+                "{}: expected {want} (or absent), the file says {v}",
+                self.key_path(key)
+            ))),
+        }
+    }
+
     pub(crate) fn u32(&mut self, key: &str) -> Result<u32, ModelError> {
         let path = self.key_path(key);
         let v = self.value(key)?;

@@ -89,15 +89,19 @@ steps below do the same thing without the wizard.
 
 ## Get running
 
-Saber runs **two models**, each from prebuilt weight packs hosted on Hugging Face. Pick one (or both;
-only one server runs at a time, they share the cards).
+Saber runs **two model architectures**, Qwen3.8-27B and Qwen3.8 Flash-Next, from prebuilt weight
+packs hosted on Hugging Face. The 27B comes in two quantizations. Pick one (or several; only one server
+runs at a time, they share the cards). You can also build every 27B pack, and Flash-Next's base pack,
+yourself from the original checkpoint: see "Build packs yourself".
 
-| | Qwen3.8-27B | Qwen3.8 Flash-Next (MoE) |
-|---|---|---|
-| Download | about 26 GB | about 70 GB of packs **plus the original 170 GB checkpoint** (see below) |
-| Hugging Face | [`Launch80/Qwen3.8-27B-NVFP4-SABER`](https://huggingface.co/Launch80/Qwen3.8-27B-NVFP4-SABER) | [`Launch80/Qwen3.8-Flash-Next-SABER`](https://huggingface.co/Launch80/Qwen3.8-Flash-Next-SABER) + [`amd/Qwen3.8-Flash-Next-Quark-MXFP4`](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4) |
-| Fetch | `tools/fetch_packs.sh 27b` (two cards, TP=2); `tools/fetch_packs.sh 27b-tp1` (one card, TP=1, about 25 GB) | `tools/fetch_packs.sh flashnext` |
-| Serve | `tools/serve_27b.sh` (two cards); `tools/serve_27b.sh --tp 1` (one card) | `tools/serve_flashnext.sh` |
+| | Qwen3.8-27B (NVFP4) | Qwen3.8-27B (Quark AWQ MXFP4) | Qwen3.8 Flash-Next (MoE) |
+|---|---|---|---|
+| Source checkpoint | [`unsloth/Qwen3.8-27B-NVFP4`](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) | [`amd/Qwen3.8-27B-Quark-AWQ-MXFP4`](https://huggingface.co/amd/Qwen3.8-27B-Quark-AWQ-MXFP4) | [`amd/Qwen3.8-Flash-Next-Quark-MXFP4`](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4) |
+| Download | about 26 GB | about 29 GB (TP=2) / 28 GB (TP=1) | about 70 GB of packs **plus the original 170 GB checkpoint** (see below) |
+| Hugging Face | [`Launch80/Qwen3.8-27B-NVFP4-SABER`](https://huggingface.co/Launch80/Qwen3.8-27B-NVFP4-SABER) | [`Launch80/Qwen3.8-27B-Quark-AWQ-MXFP4-SABER`](https://huggingface.co/Launch80/Qwen3.8-27B-Quark-AWQ-MXFP4-SABER) | [`Launch80/Qwen3.8-Flash-Next-SABER`](https://huggingface.co/Launch80/Qwen3.8-Flash-Next-SABER) + the checkpoint |
+| Fetch | `tools/fetch_packs.sh 27b` (two cards, TP=2); `tools/fetch_packs.sh 27b-tp1` (one card, TP=1, about 25 GB) | `tools/fetch_packs.sh 27b-quark` (TP=2); `tools/fetch_packs.sh 27b-quark-tp1` (TP=1) | `tools/fetch_packs.sh flashnext` |
+| Serve | `tools/serve_27b.sh` (two cards); `tools/serve_27b.sh --tp 1` (one card) | `tools/serve_27b.sh --weights quark` (two cards); `--weights quark --tp 1` (one card, **not yet booted**, see below) | `tools/serve_flashnext.sh` |
+| Numerics | W4A8: MXFP4 weights requantized from NVFP4, fp8 activations, fp8 head | W4A8: AMD's MXFP4 weights **as stored** (no requantization), fp8 activations, the checkpoint's bf16 head (see below) | MXFP4 experts as stored, fp8 trunk |
 
 ```bash
 git clone git@github.com:GGZ14/saber-engine.git && cd saber-engine
@@ -156,6 +160,27 @@ and a 3-request burst were checked on both cards; no TP=1 BetterBench run, prefi
 has been done, and the speculative tree verify form is planned for TP=2 only (a TP=1 boot runs the
 chain form and says so in its log). No single-card Flash-Next pack is hosted.
 
+**The Quark AWQ MXFP4 27B.** `tools/fetch_packs.sh 27b-quark` downloads the target pack
+(`qwen38-27b-quark-awq-mxfp4`, 20.8 GB), a DFlash2 drafter pack paired with this checkpoint's head
+(`qwen38-dflash2-drafter-quarkhead`, 8.2 GB; the engine refuses a drafter whose head differs from the
+target's, so the NVFP4 drafter cannot be used here) and the checkpoint's own tokenizer
+(`.cache/quark27b.tokenizer.json`; the chat template is the same file as the NVFP4 model's). Then
+`tools/serve_27b.sh --weights quark --enable-prefix-caching on` serves it on two cards with the same
+defaults as the NVFP4 27B (every flag and variable in "Flags and options" applies; `TIER`, `DRAFT`,
+`TOKENIZER` and `CHAT_TEMPLATE` override the defaults it picks). **Numerics:** Saber runs this
+checkpoint as W4A8: the MXFP4 weights exactly as AMD stores them (the pack re-lays them out, value-exact),
+activations quantized to fp8 e4m3 per token, fp8 KV. The checkpoint was calibrated for MXFP4 activations
+(W4A4) and bf16 KV; Saber has no bit-faithful W4A4 path, so results measure AMD's weights under Saber's
+numerics, not a reproduction of AMD's evaluation. Measured speed is on the
+[model card](https://huggingface.co/Launch80/Qwen3.8-27B-Quark-AWQ-MXFP4-SABER) (TP=2).
+**One card:** `tools/fetch_packs.sh 27b-quark-tp1` + `tools/serve_27b.sh --weights quark --tp 1`
+(packs `qwen38-27b-quark-awq-mxfp4-tp1` 19.8 GB + `qwen38-dflash2-drafter-quarkhead-tp1` 7.7 GB). The TP=1
+packs were verified offline against the checkpoint and the TP=2 packs, but **a TP=1 boot of them has
+not been measured yet**: whether the launcher's TP=1 defaults (65,536 context, 4 sequences) fit, and its
+speed, are unknown. The target is 1.3 GB larger than the NVFP4 TP=1 pack, so the KV pool will be smaller.
+
+<!-- QualityBench results for the Quark 27B are being collected; this section gets them when they are in. -->
+
 **What the 27B download contains.** The target pack (`qwen38-27b-nvfp4-devfinal-fp8head`), the DFlash2
 drafter pack (`qwen38-dflash2-drafter-fp8head`), and the tokenizer and chat template, which
 `fetch_packs.sh` puts in `.cache/`. Nothing else is needed.
@@ -180,24 +205,97 @@ default path puts it. The location is fixed in two places, both absolute paths:
 index also lists a first-party fp8 copy of the table (half the size), but it is off by default,
 gated on a numerics check, and not part of the hosted files.
 
-## Can I run any MXFP4 model?
+## Build packs yourself
 
-No. There are two separate things in the way, and neither is the quantization format.
+Saber does not load checkpoints directly. It boots from a *pack* (`SBRPACK1`, one 4096-byte-aligned file
+per GPU with a sha256 per record): the weights pre-arranged for its kernels (WMMA fragment order, scales
+transposed, the tensor-parallel split, projections merged). The pack builders in `tools/pack/` turn the
+original Hugging Face checkpoint into the same packs that are hosted. They run on the **CPU** (numpy, no
+GPU, no ROCm needed at build time), inside the same dev container as the launchers (podman or docker),
+through one entry point:
 
-1. **Saber does not load checkpoints directly.** It boots from a *pack* (`SBRPACK1`, one
-   4096-byte-aligned file per GPU with a sha256 per record): the weights pre-arranged for its GPU kernels (WMMA fragment
-   order, scales transposed, tensor-parallel split, projections merged, fp8 trunk where used). That is
-   why even a checkpoint that is already MXFP4, like AMD's Flash-Next one, gets packed first. For
-   that checkpoint the packer copies the 4-bit values and scales byte for byte (no requantization); it
-   only rearranges them. The 27B packer starts from an NVFP4, per-channel fp8 or bf16 checkpoint and
-   requantizes it to MXFP4.
-2. **Only two model architectures are implemented:** Qwen3.8-27B (dense, with the DFlash2 drafter) and
-   Qwen3.8 Flash-Next (MoE). The engine, kernels and plans are written for those layer graphs. A different
-   model family (Llama, Mistral, another Qwen) is not a repack: it needs a new model definition in
-   `crates/saber-model` and new kernel tuning rules.
+```bash
+tools/build-image.sh                                     # once (the launchers need it anyway)
+hf download amd/Qwen3.8-27B-Quark-AWQ-MXFP4 --local-dir ~/models/Qwen3.8-27B-Quark-AWQ-MXFP4
 
-So: for the two supported models, download the prebuilt packs (above). **Pack builders are not part of
-this release**, so a model we do not host cannot be packed with the tools here yet.
+tools/build_packs.sh 27b-quark --checkpoint ~/models/Qwen3.8-27B-Quark-AWQ-MXFP4           # TP=2
+tools/build_packs.sh 27b-quark --checkpoint ~/models/Qwen3.8-27B-Quark-AWQ-MXFP4 --tp 1    # one card
+tools/build_packs.sh 27b-nvfp4 --checkpoint ~/models/Qwen3.8-27B-NVFP4 [--tp 1]   # unsloth/Qwen3.8-27B-NVFP4
+tools/build_packs.sh --help                                                       # every option
+```
+
+Packs land in `$SABER_PACKS` (default `/mnt/nvme/saber-packs`) under the names the launchers use, or in
+`--out DIR`. The first run builds the `saber-packplan` tool from this repo's crates (a few minutes). The
+builder then asks `saber-packplan` for the record set (it is derived from the engine's own layer graph,
+so the builder cannot invent a record), and writes the pack.
+
+| Pack | Checkpoint | Disk for the pack | Time (12-core desktop CPU, 8 workers) |
+|---|---|---|---|
+| `27b-quark` | `amd/Qwen3.8-27B-Quark-AWQ-MXFP4` (19.8 GB) | 20.9 GB (TP=2), 19.9 GB (TP=1) | measured 187 s for TP=1 (8 workers), then a few minutes of self-check |
+| `27b-nvfp4` | `unsloth/Qwen3.8-27B-NVFP4` (23.4 GB) | 19.6 GB (TP=2), 18.6 GB (TP=1) | a few minutes |
+| `flashnext` (base pack only) | `amd/Qwen3.8-Flash-Next-Quark-MXFP4` (170 GB) | about 67 GB | not timed in this form |
+
+The build refuses to start if the output's filesystem does not have the pack's size plus 2 GB free, if the
+checkpoint directory is missing or incomplete, or if the output directory already holds files. Memory: up
+to about 1.5 GB per worker (`--workers N`, default 8).
+
+**The self-check** runs after every build (`--no-check` skips it; `tools/build_packs.sh check 27b-quark
+--pack DIR --checkpoint DIR` runs it alone):
+
+* `27b-quark`: every MXFP4 weight block of the pack, read back the way the engine reads it, must equal
+  AMD Quark's own dequantization of the checkpoint's bytes **bit for bit** (`check_quark27b.py`; `--quick`
+  checks a 32-op sample), `lm_head` must be the checkpoint's bf16 rows byte for byte and every KV scale
+  1.0; a negative control (the checkpoint with each byte's nibbles swapped) must fail every record.
+  A TP=1 build is also checked against the TP=2 pack when one sits beside it (`--tp2-pack DIR`):
+  replicated records sha-equal, split records equal to rank 0 followed by rank 1.
+* `27b-nvfp4`: NVFP4 to MXFP4 is a requantization, so there is no independent oracle for the weights;
+  the fp8 head is checked byte for byte against the checkpoint (`check_fp8_head.py`). Compare with the
+  hosted pack's manifest (below) for the full check.
+* Any pack, against the hosted one, without downloading it: fetch only its `manifest.json` (about
+  1 MB) and pass `--reference`:
+
+  ```bash
+  hf download Launch80/Qwen3.8-27B-Quark-AWQ-MXFP4-SABER qwen38-27b-quark-awq-mxfp4-tp1/manifest.json --local-dir ref
+  tools/build_packs.sh 27b-quark --checkpoint ... --tp 1 --reference ref/qwen38-27b-quark-awq-mxfp4-tp1/manifest.json
+  ```
+
+  `check_manifest.py` compares the tier id (the checkpoint's headers and config/tokenizer files), the
+  plan hash, the record table and every record's sha256. **PASS means the pack's payload is
+  byte-identical to the hosted pack.** Only the build time stamped in the headers differs; pass the
+  reference's `built_unix` as `--build-unix N` to reproduce the rank files byte for byte too. (The
+  checkpoint directory's name is part of the tier id; the container mounts it under the upstream name,
+  so a renamed download still matches. With `--host` keep the upstream name.)
+
+A PASS from the self-check means the pack carries the checkpoint's weights as the engine expects them; it
+does not test the engine. The final check is a boot (`tools/serve_27b.sh`).
+
+**The drafter.** The DFlash2 drafter pack carries the target's head. The hosted
+`qwen38-dflash2-drafter-quarkhead[-tp1]` packs already match a `27b-quark` pack you build (the head is the
+checkpoint's own, so it is the same bytes). `tools/build_packs.sh 27b-quark-drafter --drafter-pack DIR
+--target-pack DIR` re-pairs a drafter pack with a target's bf16 head (`drafter_head_pair.py`), but it needs a
+drafter pack with a **bf16** head as its source, which is not hosted; building the drafter pack itself from
+the DFlash2 checkpoint is not part of this release. For the NVFP4 27B use the hosted drafter.
+
+**Flash-Next.** `tools/build_packs.sh flashnext --checkpoint DIR` builds the EP=2 **base** pack
+(`qwen38-flashnext-quark-ep2`): the routed experts as an expert tier (Quark's 4-bit values and scales
+byte-copied, verified against Quark's dequant per expert during the build, with negative controls), the
+dense records (written where transformed, otherwise referenced in place in the checkpoint), the PLE
+index, the loader aliases and the MXFP4 MTP experts; then `check_flashnext_pack.py` re-checks it. The
+pack references the checkpoint by absolute path, so keep the checkpoint where it was at build time.
+The served pack (`qwen38-flashnext-quark-trunk8`) adds pieces this release does not rebuild for you:
+`saber flashnext-pack --pack DIR --trunk w8` (the fp8 trunk), `--hc8`, `--experts tp2` and `--vision bf16`
+are in the `saber` binary and run on the CPU, but the served pack also carries files captured from
+running the model on the GPUs (`kv_scales.json`, the fp8 KV calibration; `profile/route_profile.json`
+and `profile/lazy_runs.rank*.json`, captured expert-routing traffic), which no checkpoint contains. Copy
+those small files from the hosted pack, or serve the hosted pack. The Flash-Next builder has been run
+here only as a dry run; the end-to-end build in this form has not been run.
+
+**What cannot be packed.** Only these two architectures are implemented: Qwen3.8-27B (dense, with the
+DFlash2 drafter) and Qwen3.8 Flash-Next (MoE). The engine, kernels and plans are written for those layer
+graphs. Another model family (Llama, Mistral, another Qwen) is not a repack: it needs a new model
+definition in `crates/saber-model` and new kernel tuning rules. Another quantization of the same 27B is
+packable if it is NVFP4 (`weight_packed` + e4m3 scales), per-channel fp8 or bf16, or OCP MXFP4 (U8
+`weight` + U8 e8m0 `weight_scale`, group 32); `build_packs.sh` refuses anything else.
 
 The server listens on port 8080 and exposes `/v1/models`, `/v1/chat/completions`,
 `/v1/completions` and `/metrics`. Only one server runs at a time; they share the cards.
@@ -211,6 +309,7 @@ Both launchers take their own flags first, then pass everything else straight to
 | Flag | What it does |
 |---|---|
 | `--no-build` | Skip the `cargo build`; reuse `.cache/target-container/release/saber`. Use this for every boot after the first (a build takes about two minutes). |
+| `--weights quark` | Serve the Quark AWQ MXFP4 packs (`tools/fetch_packs.sh 27b-quark`) instead of the NVFP4 ones. |
 | `--tp 1` | Serve on ONE card (TP=1) from the `-tp1-fp8head` packs (`tools/fetch_packs.sh 27b-tp1`), on HIP device `DEVICE` (default 0), container `saber-27b-tp1-serve`. `TP=1` in the environment does the same; `--tp 2` (the default) is the two-card server. See "One card (TP=1)". |
 | `--vision` | Accept images (`image_url` parts). Same as `--vision lazy`: the vision tower lives in pinned host RAM and streams through the idle prefill arena per image. No VRAM is billed and the full 262k context stays, at about +30 ms per image. |
 | `--vision on` | Keep the tower resident (about 1.9 GiB a rank). Needs `MAX_CTX=131072`. |
@@ -234,6 +333,9 @@ Environment variables (put them before the command):
 | `WIDTHS` | `1,8` | Speculative verify widths |
 | `DRAFT_BLOCK` | `8` | Drafter block size (`4` halves the GDN slots) |
 | `MODEL` | `Qwen3.8` | Served model id |
+| `WEIGHTS` | `nvfp4` | `quark` = the Quark AWQ MXFP4 packs (same as `--weights quark`) |
+| `TIER` / `DRAFT` | by `WEIGHTS` and `--tp` | Target / drafter pack folder names under `SABER_PACKS` |
+| `TOKENIZER` / `CHAT_TEMPLATE` | `.cache/template_corpus.tokenizer.json` (quark: `.cache/quark27b.tokenizer.json`) / `.cache/template_corpus.jinja` | As paths the container sees (`/work/...` = the repo) |
 | `SABER_PACKS` | `/mnt/nvme/saber-packs` | Where the weight packs live |
 | `SABER_SHARED` | `~/saber-cache` | Scratch and logs shared between runs |
 | `SABER_IMAGE` | `localhost/saber-dev:latest` | The dev image |
@@ -386,6 +488,7 @@ generator output: they have been renamed since, and the generator no longer repr
 | `crates/saber-serve` | the OpenAI HTTP plane |
 | `crates/saber-kernels`, `prebuilt/gfx1201` | HIP kernel sources and their compiled code objects with manifests |
 | `crates/saber-mem`, `-model` | weight packs and the model graph |
+| `tools/build_packs.sh`, `tools/pack/` | the pack builders and their self-checks |
 | `tools/` | launchers, the setup wizard, kernel generators and their MXFP4 reference, `verify_prebuilt.py`, the optional kernel patch |
 
 ## License

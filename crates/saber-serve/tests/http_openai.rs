@@ -2190,3 +2190,36 @@ async fn chat_return_token_ids_as_prod_does() {
         }
     }
 }
+
+/// A NON-streaming client that hangs up mid-generation aborts the request: the handler future is
+/// dropped by hyper, and the guard riding it tells the engine. (Found 2026-11-10: a client killed
+/// mid-run left 3 generations running and 16 queued until the server restarted.)
+#[tokio::test]
+async fn a_dropped_blocking_request_aborts_the_engine_request() {
+    let (base, engine) = spawn_with(
+        vec![MockScript::in_steps_of(
+            bytes_of(&"lorem ipsum ".repeat(200)),
+            2,
+            FinishReason::Stop,
+        )],
+        Duration::from_millis(50),
+    )
+    .await;
+
+    for path in ["/v1/chat/completions"] {
+        let client = reqwest::Client::new();
+        let fut = client
+            .post(format!("{base}{path}"))
+            .json(&chat_body(json!({"stream": false, "max_tokens": 2000})))
+            .send();
+        // Give up well before the generation finishes: dropping the future closes the connection.
+        let _ = tokio::time::timeout(Duration::from_millis(200), fut).await;
+    }
+
+    let mut waited = Duration::ZERO;
+    while engine.aborted().is_empty() && waited < Duration::from_secs(2) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        waited += Duration::from_millis(10);
+    }
+    assert_eq!(engine.aborted().len(), 1, "no abort after {waited:?}");
+}
